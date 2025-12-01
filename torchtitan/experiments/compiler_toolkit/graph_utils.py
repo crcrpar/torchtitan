@@ -104,8 +104,13 @@ def joint_graph_builder(
         dump_folder: Optional folder to dump the graph to
     """
     assert isinstance(model_args, tuple)
+    # Note: When TP is enabled, args should be DTensors. When TP is disabled (FSDP-only),
+    # args can be regular tensors since there's no tensor parallel distribution.
     for idx, arg in enumerate(model_args):
-        assert isinstance(arg, DTensor), f"Argument {idx} is of type {type(arg)}"
+        if not isinstance(arg, (DTensor, torch.Tensor)):
+            raise TypeError(
+                f"Argument {idx} must be DTensor or Tensor, got {type(arg)}"
+            )
 
     # get joint graph
     (

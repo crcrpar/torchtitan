@@ -26,9 +26,19 @@ def disable_compile(job_config: JobConfig):
 
 
 def parallelize_inputs(world_mesh, args, kwargs):
+    # Determine whether TP is enabled by checking if "tp" dimension exists in the mesh
+    # (dimensions with size 1 are not included in the mesh)
+    tp_enabled = "tp" in world_mesh.mesh_dim_names
+
     def to_dtensor(tensor):
         if isinstance(tensor, torch.Tensor):
-            return DTensor.from_local(tensor, world_mesh["tp"], [Replicate()])
+            if tp_enabled:
+                # When TP is enabled, inputs need to be replicated across the TP mesh
+                return DTensor.from_local(tensor, world_mesh["tp"], [Replicate()])
+            else:
+                # When TP is disabled (FSDP-only), inputs are local to each rank.
+                # Return tensor as-is since model params are also regular tensors.
+                return tensor
         return tensor
 
     dt_args = tree_map(to_dtensor, args)
