@@ -23,6 +23,8 @@ defaults:
 
 jobs:
   build-test:
+    # Only run in the upstream repository, not in forks
+    if: github.repository == 'crcrpar/torchtitan'
     uses: pytorch/test-infra/.github/workflows/linux_job_v2.yml@main
     with:
       runner: linux.g5.48xlarge.nvidia.gpu

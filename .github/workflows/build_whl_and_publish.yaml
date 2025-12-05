@@ -12,7 +12,8 @@ permissions:
 
 jobs:
   generate-matrix:
-    if: github.repository_owner == 'pytorch'
+    # Only run in the upstream repository, not in forks
+    if: github.repository == 'crcrpar/torchtitan'
     uses: pytorch/test-infra/.github/workflows/generate_binary_build_matrix.yml@main
     with:
       package-type: wheel
@@ -23,6 +24,8 @@ jobs:
       with-rocm: enable
       python-versions: '["3.10", "3.11", "3.12"]'
   build:
+    # Only run in the upstream repository, not in forks
+    if: github.repository == 'crcrpar/torchtitan'
     needs: generate-matrix
     name: ${{ matrix.repository }}
     uses: pytorch/test-infra/.github/workflows/build_wheels_linux.yml@main

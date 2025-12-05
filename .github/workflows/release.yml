@@ -8,6 +8,8 @@ on:
 
 jobs:
   release-build:
+    # Only run in the upstream repository, not in forks
+    if: github.repository == 'crcrpar/torchtitan'
     runs-on: ubuntu-latest
 
     steps:
@@ -29,6 +31,8 @@ jobs:
           path: dist/
 
   pypi-publish:
+    # Only run in the upstream repository, not in forks
+    if: github.repository == 'crcrpar/torchtitan'
     runs-on: ubuntu-latest
     needs:
       - release-build

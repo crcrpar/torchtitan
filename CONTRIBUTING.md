@@ -17,6 +17,8 @@ We actively welcome your pull requests.
 5. Make sure your code lints (`pre-commit run --all-files`).
 6. If you haven't already, complete the Contributor License Agreement ("CLA").
 
+**Note:** GitHub Actions workflows are configured to run only in the upstream `crcrpar/torchtitan` repository. They will not run automatically in forks. This is intentional to prevent unnecessary CI runs and protect repository secrets.
+
 ### Contributor License Agreement ("CLA")
 In order to accept your pull request, we need you to submit a CLA. You only need
 to do this once to work on any of Meta's open source projects.
