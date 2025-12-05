@@ -13,6 +13,8 @@ defaults:
 
 jobs:
   lint:
+    # Only run in the upstream repository, not in forks
+    if: github.repository == 'crcrpar/torchtitan'
     runs-on: ubuntu-latest
     strategy:
       matrix:

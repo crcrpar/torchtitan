@@ -22,6 +22,8 @@ concurrency:
 
 jobs:
   docker-build:
+    # Only run in the upstream repository, not in forks
+    if: github.repository == 'crcrpar/torchtitan'
     strategy:
       fail-fast: false
       matrix:
