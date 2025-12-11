@@ -31,6 +31,9 @@ from torchtitan.distributed.context_parallel import prepare_context_parallel_inp
 from torchtitan.protocols import ModelProtocol
 from torchtitan.protocols.model_converter import build_model_converters
 from torchtitan.tools import utils
+from torchtitan.tools.blackwell_inductor_config import (
+    setup_from_env as setup_blackwell_inductor,
+)
 from torchtitan.tools.logging import init_logger, logger
 from torchtitan.tools.profiling import (
     maybe_enable_memory_snapshot,
@@ -90,6 +93,9 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         self.device = torch.device(f"{device_type}:{int(os.environ['LOCAL_RANK'])}")
         # Device has to be set before creating TorchFT manager.
         device_module.set_device(self.device)
+
+        # Apply Blackwell-specific inductor optimizations if on Blackwell GPU
+        setup_blackwell_inductor()
 
         # init distributed and build meshes
         self.parallel_dims = parallel_dims = self.init_distributed()

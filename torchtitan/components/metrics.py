@@ -4,11 +4,12 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+import json
 import os
 import time
 from collections import namedtuple
 from datetime import datetime
-from typing import Any, TYPE_CHECKING
+from typing import Any, TextIO, TYPE_CHECKING
 
 import torch
 from torch.utils.tensorboard import SummaryWriter
@@ -172,6 +173,54 @@ class WandBLogger(BaseLogger):
             self.wandb.finish()
 
 
+class JSONLogger(BaseLogger):
+    """Logger implementation for JSON Lines file output.
+
+    Writes metrics to a JSON Lines file (.jsonl) where each line is a valid JSON object
+    containing the step number and all metrics for that step. This format is easy to parse
+    and can be loaded into pandas or other data analysis tools.
+
+    Example output:
+        {"step": 1, "loss_metrics/global_avg_loss": 10.5, "throughput(tps)": 1000, ...}
+        {"step": 10, "loss_metrics/global_avg_loss": 9.2, "throughput(tps)": 1050, ...}
+    """
+
+    def __init__(self, log_dir: str, tag: str | None = None):
+        self.tag = tag
+        os.makedirs(log_dir, exist_ok=True)
+
+        self.file_path = os.path.join(log_dir, "metrics.jsonl")
+        self._file: TextIO | None = None
+        self._file = open(self.file_path, "a")
+        logger.info(
+            f"JSON metrics logging enabled. Logs will be saved at {self.file_path}"
+        )
+
+    def log(self, metrics: dict[str, Any], step: int) -> None:
+        if self._file is None:
+            return
+
+        # Build the record with step first
+        record: dict[str, Any] = {"step": step}
+
+        # Add metrics with optional tag prefix
+        for k, v in metrics.items():
+            key = k if self.tag is None else f"{self.tag}/{k}"
+            # Convert tensor values to Python types
+            if isinstance(v, torch.Tensor):
+                v = v.item()
+            record[key] = v
+
+        # Write as JSON line
+        self._file.write(json.dumps(record) + "\n")
+        self._file.flush()
+
+    def close(self) -> None:
+        if self._file is not None:
+            self._file.close()
+            self._file = None
+
+
 class LoggerContainer(BaseLogger):
     """Container to call all loggers enabled in the job config."""
 
@@ -265,12 +314,15 @@ def _build_metric_logger(
     # Log initial config state
     logger.debug(
         f"Building logger with config: wandb={metrics_config.enable_wandb}, "
-        f"tensorboard={metrics_config.enable_tensorboard}"
+        f"tensorboard={metrics_config.enable_tensorboard}, "
+        f"json={metrics_config.enable_json}"
     )
 
     # Check if any logging backend is enabled
     has_logging_enabled = (
-        metrics_config.enable_tensorboard or metrics_config.enable_wandb
+        metrics_config.enable_tensorboard
+        or metrics_config.enable_wandb
+        or metrics_config.enable_json
     )
 
     # Determine if this rank should log
@@ -287,22 +339,25 @@ def _build_metric_logger(
         logger.debug("Returning BaseLogger due to should_log=False")
         return BaseLogger()
 
-    # Setup logging directory
+    # Setup base logging directory
     dump_dir = job_config.job.dump_folder
-    base_log_dir = os.path.join(
-        dump_dir, metrics_config.save_tb_folder, datetime.now().strftime("%Y%m%d-%H%M")
-    )
+    timestamp = datetime.now().strftime("%Y%m%d-%H%M")
+
+    # Base directory for TensorBoard/WandB (uses save_tb_folder)
+    base_log_dir = os.path.join(dump_dir, metrics_config.save_tb_folder, timestamp)
+
+    # Directory for JSON logs (uses save_json_folder)
+    json_log_dir = os.path.join(dump_dir, metrics_config.save_json_folder, timestamp)
 
     if job_config.fault_tolerance.enable:
-        base_log_dir = os.path.join(
-            base_log_dir,
-            f"replica_{job_config.fault_tolerance.replica_id}",
-        )
+        replica_suffix = f"replica_{job_config.fault_tolerance.replica_id}"
+        base_log_dir = os.path.join(base_log_dir, replica_suffix)
+        json_log_dir = os.path.join(json_log_dir, replica_suffix)
 
     if metrics_config.save_for_all_ranks:
-        base_log_dir = os.path.join(
-            base_log_dir, f"rank_{torch.distributed.get_rank()}"
-        )
+        rank_suffix = f"rank_{torch.distributed.get_rank()}"
+        base_log_dir = os.path.join(base_log_dir, rank_suffix)
+        json_log_dir = os.path.join(json_log_dir, rank_suffix)
 
     # Create logger container
     logger_container = LoggerContainer()
@@ -325,6 +380,11 @@ def _build_metric_logger(
         logger.debug("Creating TensorBoard logger")
         tensorboard_logger = TensorBoardLogger(base_log_dir, tag)
         logger_container.add_logger(tensorboard_logger)
+
+    if metrics_config.enable_json:
+        logger.debug("Creating JSON logger")
+        json_logger = JSONLogger(json_log_dir, tag)
+        logger_container.add_logger(json_logger)
 
     if logger_container.number_of_loggers == 0:
         logger.debug("No loggers enabled, returning an empty LoggerContainer")

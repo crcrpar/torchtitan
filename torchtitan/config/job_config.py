@@ -86,7 +86,7 @@ class Metrics:
 
     save_for_all_ranks: bool = False
     """
-    Whether to save TensorBoard/Wandb metrics only for rank 0 or for all ranks.
+    Whether to save TensorBoard/Wandb/JSON metrics only for rank 0 or for all ranks.
     When this option is False and pipeline_parallel_degree is > 1, the metrics
     component uses the 0th rank of the last stage pipeline group, which is the
     only stage that computes loss metrics.
@@ -94,6 +94,12 @@ class Metrics:
 
     enable_wandb: bool = False
     """Whether to log metrics to Weights & Biases"""
+
+    enable_json: bool = False
+    """Whether to log metrics to a JSON Lines file"""
+
+    save_json_folder: str = "metrics"
+    """Folder to save JSON metrics files"""
 
 
 @dataclass
