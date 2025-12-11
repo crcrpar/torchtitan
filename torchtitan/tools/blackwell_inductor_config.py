@@ -32,6 +32,9 @@ Environment Variables:
     INDUCTOR_BLACKWELL_DISABLE: Set to "1" to skip all Blackwell optimizations.
     INDUCTOR_PDL: Override PDL setting ("0" or "1").
     INDUCTOR_TMA: Override TMA setting ("0" or "1"). TMA is disabled by default.
+    INDUCTOR_PERSISTENT_TMA: Enable persistent TMA matmul ("0" or "1").
+    INDUCTOR_TMA_STORE: Enable TMA store operations ("0" or "1").
+    INDUCTOR_SKIP_L1: Enable L1 cache bypass ("0" or "1").
 
 Note: Some features from the optimization guide (TMA, persistent TMA matmul,
 L1 cache bypass) are disabled by default due to compatibility issues with
@@ -180,13 +183,46 @@ def _apply_env_overrides() -> None:
         logger.info(f"INDUCTOR_PDL override: enable_pdl={enable_pdl}")
 
     # TMA override: INDUCTOR_TMA=0 (off) or INDUCTOR_TMA=1 (on)
-    # TMA is disabled by default due to compatibility issues
+    # TMA is disabled by default due to compatibility issues with BF16
+    # but works with Float8
     tma_override = os.environ.get("INDUCTOR_TMA")
     if tma_override is not None:
         enable_tma = tma_override == "1"
         torch._inductor.config.triton.use_tensor_descriptor = enable_tma
         torch._inductor.config.assume_aligned_inputs = enable_tma
         logger.info(f"INDUCTOR_TMA override: use_tensor_descriptor={enable_tma}")
+
+    # Persistent TMA matmul override: INDUCTOR_PERSISTENT_TMA=1 (on)
+    # Requires TMA to be enabled. Optimizes large K-dimension matmuls.
+    persistent_tma_override = os.environ.get("INDUCTOR_PERSISTENT_TMA")
+    if persistent_tma_override is not None:
+        enable_persistent_tma = persistent_tma_override == "1"
+        torch._inductor.config.triton.enable_persistent_tma_matmul = (
+            enable_persistent_tma
+        )
+        logger.info(
+            f"INDUCTOR_PERSISTENT_TMA override: "
+            f"enable_persistent_tma_matmul={enable_persistent_tma}"
+        )
+
+    # TMA store override: INDUCTOR_TMA_STORE=1 (on)
+    # Requires TMA to be enabled. Optimizes store operations.
+    tma_store_override = os.environ.get("INDUCTOR_TMA_STORE")
+    if tma_store_override is not None:
+        enable_tma_store = tma_store_override == "1"
+        torch._inductor.config.triton.enable_template_tma_store = enable_tma_store
+        logger.info(
+            f"INDUCTOR_TMA_STORE override: "
+            f"enable_template_tma_store={enable_tma_store}"
+        )
+
+    # L1 cache bypass override: INDUCTOR_SKIP_L1=1 (on)
+    # Bypasses L1 cache for single-use buffers. May cause KeyError in some workloads.
+    skip_l1_override = os.environ.get("INDUCTOR_SKIP_L1")
+    if skip_l1_override is not None:
+        enable_skip_l1 = skip_l1_override == "1"
+        torch._inductor.config.triton.skip_l1_cache = enable_skip_l1
+        logger.info(f"INDUCTOR_SKIP_L1 override: skip_l1_cache={enable_skip_l1}")
 
 
 def setup_from_env() -> None:
@@ -204,14 +240,25 @@ def setup_from_env() -> None:
             By default, PDL is disabled in all stages for stability.
         INDUCTOR_TMA: Override TMA setting. "0" to disable, "1" to enable.
             TMA (Tensor Memory Accelerator) is disabled by default due to
-            compatibility issues with certain tensor shapes in PyTorch inductor.
+            compatibility issues with BF16 tensor shapes, but works with Float8.
+        INDUCTOR_PERSISTENT_TMA: Enable persistent TMA matmul. "1" to enable.
+            Requires TMA to be enabled. Optimizes large K-dimension matmuls.
+        INDUCTOR_TMA_STORE: Enable TMA store operations. "1" to enable.
+            Requires TMA to be enabled. Optimizes store operations.
+        INDUCTOR_SKIP_L1: Enable L1 cache bypass. "1" to enable.
+            Bypasses L1 cache for single-use buffers. May cause issues in some
+            workloads (KeyError in buffer tracking).
 
     Example:
         export INDUCTOR_STAGE=2
         python train.py ...
 
-        # Or with TMA enabled (experimental):
-        export INDUCTOR_STAGE=1 INDUCTOR_TMA=1
+        # Float8 with TMA + PDL (best Float8 config):
+        export INDUCTOR_STAGE=0 INDUCTOR_TMA=1 INDUCTOR_PDL=1
+        python train.py ...
+
+        # Float8 with all TMA features:
+        export INDUCTOR_STAGE=0 INDUCTOR_TMA=1 INDUCTOR_PERSISTENT_TMA=1 INDUCTOR_TMA_STORE=1
         python train.py ...
     """
     # Check if disabled
