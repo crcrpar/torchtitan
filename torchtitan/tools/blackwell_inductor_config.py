@@ -22,11 +22,20 @@ Usage:
     setup_from_env()
 
 Stages:
-    Stage 1 (Conservative): Core TMA + basic CUTLASS. Start here.
-    Stage 2 (Production): Adds persistent TMA, Blackwell CUTLASS kernels, L1 bypass.
-    Stage 3 (Maximum): Exhaustive search, TMA store. For long training runs only.
+    Stage 0 (None): No optimizations, use PyTorch defaults.
+    Stage 1 (Conservative): Basic CUTLASS with Blackwell kernels. Start here.
+    Stage 2 (Production): Adds Blackwell TMA warp-specialized CUTLASS kernels.
+    Stage 3 (Maximum): Exhaustive search. For long training runs only.
 
-Reference: See docs for performance expectations and debugging tips.
+Environment Variables:
+    INDUCTOR_STAGE: Stage to use (0, 1, 2, or 3). Default: 1
+    INDUCTOR_BLACKWELL_DISABLE: Set to "1" to skip all Blackwell optimizations.
+    INDUCTOR_PDL: Override PDL setting ("0" or "1").
+    INDUCTOR_TMA: Override TMA setting ("0" or "1"). TMA is disabled by default.
+
+Note: Some features from the optimization guide (TMA, persistent TMA matmul,
+L1 cache bypass) are disabled by default due to compatibility issues with
+the current PyTorch inductor. Use environment overrides to test them.
 """
 
 import os
@@ -50,25 +59,27 @@ def setup_stage1() -> None:
     Stage 1: Conservative baseline - Start here.
 
     Enables core Blackwell features with minimal risk:
-    - Core TMA (Tensor Memory Accelerator)
-    - Basic CUTLASS integration
+    - Basic CUTLASS integration with Blackwell kernels
     - Default search space (faster compilation)
+    - TMA disabled due to potential compatibility issues
 
     Expected results:
     - Compile time: 2-5 minutes
-    - Speedup: ~1.5-1.7x vs eager
+    - Speedup: ~1.3-1.5x vs eager
     - Stable training with low debugging complexity
     """
     logger.info("Setting up Stage 1: Conservative Blackwell Inductor configuration")
 
-    # Core TMA (required together)
-    torch._inductor.config.triton.use_tensor_descriptor = True
-    torch._inductor.config.assume_aligned_inputs = True
+    # NOTE: TMA (use_tensor_descriptor + assume_aligned_inputs) is disabled
+    # due to compatibility issues with certain tensor shapes in PyTorch inductor.
+    # Enable via INDUCTOR_TMA=1 if you want to test it.
+    torch._inductor.config.triton.use_tensor_descriptor = False
+    torch._inductor.config.assume_aligned_inputs = False
 
     # Blackwell epilogue optimization
     torch._inductor.config.triton.enable_epilogue_subtiling = True
 
-    # Basic CUTLASS
+    # Basic CUTLASS with Blackwell support
     torch._inductor.config.max_autotune_gemm_backends = "ATEN,TRITON,CUTLASS"
     torch._inductor.config.max_autotune_gemm = True
     torch._inductor.config.cutlass.cutlass_epilogue_fusion_enabled = True
@@ -91,30 +102,32 @@ def setup_stage2() -> None:
 
     Use after Stage 1 is validated stable for 1000+ steps.
     Adds proven optimizations:
-    - Persistent TMA matmul
-    - Blackwell-specific CUTLASS kernels (SM100 TMA)
-    - L1 cache bypass for single-use buffers
+    - Blackwell-specific CUTLASS kernels (SM100 TMA warp-specialized)
+
+    Note: Some features from the optimization guide are disabled due to
+    compatibility issues:
+    - Persistent TMA matmul: Requires TMA which has issues
+    - L1 cache bypass: Causes KeyError in buffer tracking
 
     Expected results:
     - Compile time: 4-6 minutes
     - Additional 5-10% throughput over Stage 1
-    - Total speedup: ~1.6-1.85x vs eager
+    - Total speedup: ~1.4-1.6x vs eager
     """
     logger.info("Setting up Stage 2: Production Blackwell Inductor configuration")
 
     # Start with Stage 1
     setup_stage1()
 
-    # Add proven optimizations
-    torch._inductor.config.triton.enable_persistent_tma_matmul = True
-
-    # Filter for Blackwell TMA kernels (SM100)
+    # Filter for Blackwell TMA warp-specialized kernels (SM100)
+    # This enables the most optimized CUTLASS kernels for Blackwell
     torch._inductor.config.cutlass.cutlass_op_allowlist_regex = (
         "tmawarpspecialized.*sm100"
     )
 
-    # L1 cache bypass for single-use buffers
-    torch._inductor.config.triton.skip_l1_cache = True
+    # NOTE: The following are disabled due to compatibility issues:
+    # - enable_persistent_tma_matmul: Requires TMA which has issues
+    # - skip_l1_cache: Causes KeyError in buffer tracking
 
     logger.info("Stage 2 Blackwell configuration applied")
 
@@ -129,14 +142,15 @@ def setup_stage3() -> None:
     - You have time to debug if issues arise
 
     Adds:
-    - Exhaustive GEMM search space
-    - TMA store operations
+    - Exhaustive GEMM search space (more kernel configurations)
     - Exhaustive FlexAttention search
+
+    Note: TMA store operations are disabled due to compatibility issues.
 
     Expected results:
     - First compile: 15-30 minutes
-    - Additional 5-15% over Stage 2
-    - Total speedup: ~1.7-2.0x vs eager
+    - Additional 5-10% over Stage 2
+    - Total speedup: ~1.5-1.7x vs eager
     """
     logger.info("Setting up Stage 3: Maximum Blackwell Inductor configuration")
     logger.warning("First compile will take 15-30 minutes!")
@@ -147,11 +161,11 @@ def setup_stage3() -> None:
     # Exhaustive search (adds significant compile time)
     torch._inductor.config.max_autotune_gemm_search_space = "EXHAUSTIVE"
 
-    # TMA store operations (experimental)
-    torch._inductor.config.triton.enable_template_tma_store = True
-
     # Exhaustive FlexAttention search
     torch._inductor.config.max_autotune_flex_search_space = "EXHAUSTIVE"
+
+    # NOTE: TMA store operations are disabled due to compatibility issues
+    # torch._inductor.config.triton.enable_template_tma_store = True
 
     logger.info("Stage 3 Blackwell configuration applied")
 
@@ -164,6 +178,15 @@ def _apply_env_overrides() -> None:
         enable_pdl = pdl_override == "1"
         torch._inductor.config.triton.enable_pdl = enable_pdl
         logger.info(f"INDUCTOR_PDL override: enable_pdl={enable_pdl}")
+
+    # TMA override: INDUCTOR_TMA=0 (off) or INDUCTOR_TMA=1 (on)
+    # TMA is disabled by default due to compatibility issues
+    tma_override = os.environ.get("INDUCTOR_TMA")
+    if tma_override is not None:
+        enable_tma = tma_override == "1"
+        torch._inductor.config.triton.use_tensor_descriptor = enable_tma
+        torch._inductor.config.assume_aligned_inputs = enable_tma
+        logger.info(f"INDUCTOR_TMA override: use_tensor_descriptor={enable_tma}")
 
 
 def setup_from_env() -> None:
@@ -179,13 +202,16 @@ def setup_from_env() -> None:
         INDUCTOR_BLACKWELL_DISABLE: If set to "1", skip Blackwell optimizations
         INDUCTOR_PDL: Override PDL setting. "0" to disable, "1" to enable.
             By default, PDL is disabled in all stages for stability.
+        INDUCTOR_TMA: Override TMA setting. "0" to disable, "1" to enable.
+            TMA (Tensor Memory Accelerator) is disabled by default due to
+            compatibility issues with certain tensor shapes in PyTorch inductor.
 
     Example:
         export INDUCTOR_STAGE=2
         python train.py ...
 
-        # Or with PDL explicitly disabled:
-        export INDUCTOR_STAGE=2 INDUCTOR_PDL=0
+        # Or with TMA enabled (experimental):
+        export INDUCTOR_STAGE=1 INDUCTOR_TMA=1
         python train.py ...
     """
     # Check if disabled
