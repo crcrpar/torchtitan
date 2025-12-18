@@ -82,10 +82,20 @@ def setup_stage1() -> None:
     # Blackwell epilogue optimization
     torch._inductor.config.triton.enable_epilogue_subtiling = True
 
-    # Basic CUTLASS with Blackwell support
+    # Basic CUTLASS with Blackwell support.
+    # NOTE: In newer PyTorch builds, CUTLASS tuning options live under
+    # `torch._inductor.config.cuda.*` instead of `torch._inductor.config.cutlass`.
+    # We first configure the global GEMM backends, then enable epilogue fusion
+    # using whichever namespace this build exposes.
     torch._inductor.config.max_autotune_gemm_backends = "ATEN,TRITON,CUTLASS"
     torch._inductor.config.max_autotune_gemm = True
-    torch._inductor.config.cutlass.cutlass_epilogue_fusion_enabled = True
+    if hasattr(torch._inductor.config, "cuda") and hasattr(
+        torch._inductor.config.cuda, "cutlass_epilogue_fusion_enabled"
+    ):
+        torch._inductor.config.cuda.cutlass_epilogue_fusion_enabled = True
+    elif hasattr(torch._inductor.config, "cutlass"):
+        # Backwards compatibility with older Inductor layouts
+        torch._inductor.config.cutlass.cutlass_epilogue_fusion_enabled = True
 
     # DEFAULT search space (faster compilation)
     torch._inductor.config.max_autotune_gemm_search_space = "DEFAULT"
@@ -122,11 +132,19 @@ def setup_stage2() -> None:
     # Start with Stage 1
     setup_stage1()
 
-    # Filter for Blackwell TMA warp-specialized kernels (SM100)
-    # This enables the most optimized CUTLASS kernels for Blackwell
-    torch._inductor.config.cutlass.cutlass_op_allowlist_regex = (
-        "tmawarpspecialized.*sm100"
-    )
+    # Filter for Blackwell TMA warp-specialized kernels (SM100).
+    # This enables the most optimized CUTLASS kernels for Blackwell.
+    # Respect the current Inductor config layout (cuda.* vs cutlass.*).
+    if hasattr(torch._inductor.config, "cuda") and hasattr(
+        torch._inductor.config.cuda, "cutlass_op_allowlist_regex"
+    ):
+        torch._inductor.config.cuda.cutlass_op_allowlist_regex = (
+            "tmawarpspecialized.*sm100"
+        )
+    elif hasattr(torch._inductor.config, "cutlass"):
+        torch._inductor.config.cutlass.cutlass_op_allowlist_regex = (
+            "tmawarpspecialized.*sm100"
+        )
 
     # NOTE: The following are disabled due to compatibility issues:
     # - enable_persistent_tma_matmul: Requires TMA which has issues
