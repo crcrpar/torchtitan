@@ -79,8 +79,8 @@ def setup_stage1() -> None:
     torch._inductor.config.triton.use_tensor_descriptor = False
     torch._inductor.config.assume_aligned_inputs = False
 
-    # Blackwell epilogue optimization
-    torch._inductor.config.triton.enable_epilogue_subtiling = True
+    # Note: enable_epilogue_subtiling was removed in PyTorch 2.11+
+    # Epilogue fusion is now controlled via CUTLASS backend settings
 
     # Basic CUTLASS with Blackwell support.
     # NOTE: In newer PyTorch builds, CUTLASS tuning options live under
