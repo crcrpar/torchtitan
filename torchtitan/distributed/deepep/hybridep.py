@@ -38,6 +38,21 @@ from torchtitan.models.common.moe.utils import (
 _buffer: Any = None  # Global buffer instance
 
 
+@dataclass
+class _TracingBufferConfig:
+    hidden_dim: int
+    max_num_of_tokens_per_rank: int
+    num_of_experts_per_rank: int
+
+
+@dataclass
+class _TracingHybridEPBuffer:
+    group: ProcessGroup
+    group_size: int
+    config: _TracingBufferConfig
+    tracing_only: bool = True
+
+
 class DispatchHandle(OpaqueBase):
     """Opaque wrapper for HybridEP dispatch handle.
 
@@ -100,7 +115,7 @@ _handle_type = get_opaque_type_name(DispatchHandle)
 
 torch.library.define(
     "hybridep::dispatch",
-    f"(Tensor x, Tensor topk_idx, Tensor topk_weights, int num_experts, "
+    f"(Tensor x, Tensor topk_idx, Tensor topk_weights, int num_local_experts, int num_experts, "
     f"bool non_blocking, float? moe_expert_capacity_factor) -> (Tensor, Tensor, Tensor, {_handle_type})",
 )
 
@@ -143,6 +158,7 @@ def _dispatch_impl(
     x: torch.Tensor,
     topk_idx: torch.Tensor,
     topk_weights: torch.Tensor,
+    num_local_experts: int,
     num_experts: int,
     non_blocking: bool = False,
     moe_expert_capacity_factor: float | None = None,
@@ -163,7 +179,6 @@ def _dispatch_impl(
             "HybridEP buffer not initialized. Call dispatch_tokens() first."
         )
 
-    num_local_experts = num_experts // _buffer.group_size
     from deep_ep.hybrid_ep_buffer import (  # pyrefly: ignore [missing-import]
         indices_to_map,
     )
@@ -220,16 +235,17 @@ def _dispatch_fake(
     x: torch.Tensor,
     topk_idx: torch.Tensor,
     topk_weights: torch.Tensor,
+    num_local_experts: int,
     num_experts: int,
     non_blocking: bool = False,
     moe_expert_capacity_factor: float | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, DispatchHandle]:
     """Fake dispatch for torch.compile tracing."""
-    num_local_experts = num_experts // _buffer.group_size
+    group_size = num_experts // num_local_experts
     if non_blocking:
         out_tokens = _num_permuted_tokens_for_non_blocking(
             x.shape[0],
-            _buffer.group_size,
+            group_size,
             num_local_experts,
             topk_idx.shape[1],
             moe_expert_capacity_factor,  # pyrefly: ignore [bad-argument-type]
@@ -237,7 +253,8 @@ def _dispatch_fake(
     else:
         out_tokens = x.shape[0]
     hidden = x.new_empty(out_tokens, x.shape[1])
-    scores = x.new_empty(0, dtype=torch.float32)
+    # Fake tracing must preserve the deferred-score shape used by combine_tokens.
+    scores = x.new_empty(out_tokens, dtype=torch.float32)
     tpe = x.new_empty(num_local_experts, dtype=torch.int64)
     return hidden, scores, tpe, DispatchHandle()
 
@@ -266,13 +283,19 @@ def _combine_fake(
 def _dispatch_backward(ctx, grad_hidden, grad_scores, grad_tpe, grad_handle):
     """Backward: gather gradients via combine."""
     if grad_hidden is None:
-        return None, None, None, None, None
+        return None, None, None, None, None, None, None
 
     dispatch_handle = ctx.dispatch_handle
-    if dispatch_handle is None or dispatch_handle.value is None:
-        raise RuntimeError("DispatchHandle not found in dispatch backward")
-
     (topk_idx,) = ctx.saved_tensors
+    if dispatch_handle is None or dispatch_handle.value is None:
+        grad_x = grad_hidden.new_empty(topk_idx.shape[0], grad_hidden.shape[1]).to(
+            ctx.input_dtype
+        )
+        grad_weights = None
+        if grad_scores is not None:
+            grad_weights = grad_scores.new_empty(topk_idx.shape)
+        return grad_x, None, grad_weights, None, None, None, None
+
     grad_x, grad_probs_dense = _buffer.combine_with_unpermute(
         hidden=grad_hidden,
         probs=grad_scores
@@ -288,12 +311,12 @@ def _dispatch_backward(ctx, grad_hidden, grad_scores, grad_tpe, grad_handle):
         if grad_probs_dense is not None
         else None
     )
-    return grad_x, None, grad_weights, None, None, None
+    return grad_x, None, grad_weights, None, None, None, None
 
 
 def _dispatch_setup_context(ctx, inputs, output):
     """Save context for dispatch backward."""
-    x, topk_idx, _, _, _, _ = inputs
+    x, topk_idx, _, _, _, _, _ = inputs
     _, _, _, dispatch_handle = output
     ctx.dispatch_handle = dispatch_handle
     ctx.input_dtype = x.dtype
@@ -304,7 +327,11 @@ def _combine_backward(ctx, grad_combined):
     """Backward: scatter gradients via dispatch."""
     dispatch_handle = ctx.dispatch_handle
     if dispatch_handle is None or dispatch_handle.value is None:
-        raise RuntimeError("DispatchHandle not found in combine backward")
+        return (
+            grad_combined.new_empty(ctx.num_permuted_tokens, grad_combined.shape[1]),
+            None,
+            None,
+        )
 
     # Must pass pad_multiple so backward gradients entering ScaledGroupedMM
     # (torchao MXFP8) also have rows aligned to 32.
@@ -374,6 +401,7 @@ def get_buffer(
 
     needs_reinit = (
         _buffer is None
+        or getattr(_buffer, "tracing_only", False)
         or _buffer.group != group
         or _buffer.config.hidden_dim < hidden_dim
         or _buffer.config.max_num_of_tokens_per_rank < max_tokens_per_rank
@@ -381,6 +409,18 @@ def get_buffer(
     )
 
     if needs_reinit:
+        if torch.compiler.is_compiling():
+            _buffer = _TracingHybridEPBuffer(
+                group=group,
+                group_size=group.size(),
+                config=_TracingBufferConfig(
+                    hidden_dim=hidden_dim,
+                    max_num_of_tokens_per_rank=max_tokens_per_rank,
+                    num_of_experts_per_rank=num_local_experts,
+                ),
+            )
+            return
+
         _buffer = HybridEPBuffer(
             group=group,
             hidden_dim=hidden_dim,
@@ -444,6 +484,7 @@ def dispatch_tokens(
         hidden_states,
         selected_experts_indices,
         top_scores,
+        num_local_experts,
         num_experts,
         non_blocking,
         non_blocking_expert_capacity_factor,

@@ -36,12 +36,13 @@ class DeepEPMoE(MoE):
 
     @dataclass(kw_only=True, slots=True)
     class Config(MoE.Config):
-        pass
+        comm_backend: str = "deepep"
 
     def __init__(self, config: Config, *, dim: int):
         super().__init__(config, dim=dim)
         # DeepEP doesn't use reorderer - routing handled by DeepEPExpertParallel
         self.reorderer = None  # pyrefly: ignore [bad-assignment]
+        self.comm_backend = config.comm_backend
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -104,7 +105,8 @@ class DeepEPMoE(MoE):
         # Sync the combine operation before using routed_output.
         # This inserts a CUDA stream wait, ensuring combine is complete before
         # the subsequent addition or reshape operations read routed_output.
-        sync_combine()
+        if self.comm_backend == "deepep":
+            sync_combine()
 
         if out is None:
             return routed_output.reshape(bs, slen, dim)

@@ -122,6 +122,8 @@ def parallelize_deepseekv3(
             ep_mesh=parallel_dims.get_optional_mesh("ep"),
             etp_mesh=parallel_dims.get_optional_mesh("etp"),
             ep_etp_mesh=parallel_dims.get_optional_mesh(["ep", "etp"]),
+            comm_backend=parallelism.expert_parallel_comm_backend,
+            hybridep_non_blocking_expert_capacity_factor=parallelism.hybridep_non_blocking_expert_capacity_factor,
         )
 
     if ac_config.mode != "none":

@@ -317,7 +317,10 @@ class DeepSeekV3Model(Decoder):
             if parallelism.expert_parallel_comm_backend in ("deepep", "hybridep"):
                 from torchtitan.models.common.moe.moe_deepep import DeepEPMoE
 
-                self.layer.moe = DeepEPMoE.Config(**_dc.asdict(self.layer.moe))
+                self.layer.moe = DeepEPMoE.Config(
+                    **_dc.asdict(self.layer.moe),
+                    comm_backend=parallelism.expert_parallel_comm_backend,
+                )
 
         def get_nparams_and_flops(
             self, model: nn.Module, seq_len: int
