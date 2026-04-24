@@ -60,6 +60,7 @@ def parallelize_flux(
         param_dtype=TORCH_DTYPE_MAP[training.mixed_precision_param],
         reduce_dtype=TORCH_DTYPE_MAP[training.mixed_precision_reduce],
         cpu_offload=training.enable_cpu_offload,
+        enable_symm_mem=parallelism.enable_fsdp_symm_mem,
     )
 
     logger.info("Applied fully_shard to the model")
@@ -73,16 +74,10 @@ def apply_fsdp(
     param_dtype: torch.dtype,
     reduce_dtype: torch.dtype,
     cpu_offload: bool = False,
+    enable_symm_mem: bool = False,
 ):
     """
     Apply data parallelism (via FSDP2) to the model.
-
-    Args:
-        model (nn.Module): The model to apply data parallelism to.
-        dp_mesh (DeviceMesh): The device mesh to use for data parallelism.
-        param_dtype (torch.dtype): The data type to use for model parameters.
-        reduce_dtype (torch.dtype): The data type to use for reduction operations.
-        cpu_offload (bool): Whether to offload model parameters to CPU. Defaults to False.
     """
     mp_policy = MixedPrecisionPolicy(param_dtype=param_dtype, reduce_dtype=reduce_dtype)
     fsdp_config: dict[str, Any] = {"mesh": dp_mesh, "mp_policy": mp_policy}
@@ -96,33 +91,27 @@ def apply_fsdp(
         model.txt_in,
     ]
     for layer in linear_layers:
-        # pyrefly: ignore [no-matching-overload]
         fully_shard(layer, **fsdp_config)
 
-    # pyrefly: ignore [not-iterable]
     for block in model.double_blocks:
-        # pyrefly: ignore [no-matching-overload]
         fully_shard(
             block,
             **fsdp_config,
         )
 
-    # pyrefly: ignore [not-iterable]
     for block in model.single_blocks:
-        # pyrefly: ignore [no-matching-overload]
         fully_shard(
             block,
             **fsdp_config,
         )
 
     # apply FSDP to last layer. Set reshard_after_forward=False for last layer to avoid gather right after reshard
-    # pyrefly: ignore [no-matching-overload]
     fully_shard(model.final_layer, **fsdp_config, reshard_after_forward=False)
 
     # Wrap all the rest of model
     fully_shard(model, **fsdp_config)
 
-    if parallelism.enable_fsdp_symm_mem:
+    if enable_symm_mem:
         enable_fsdp_symm_mem(model)
 
     # Disable FSDP's automatic gradient division for all FSDP modules
@@ -134,14 +123,10 @@ def apply_compile(model: nn.Module, compile_config: CompileConfig):
     Apply torch.compile to each DoubleStreamBlock and SingleStreamBlock, which
     makes compilation efficient due to repeated structure.
     """
-    # pyrefly: ignore [not-iterable]
     for block in model.double_blocks:
-        # pyrefly: ignore [missing-attribute]
         block.compile(backend=compile_config.backend, fullgraph=True)
 
-    # pyrefly: ignore [not-iterable]
     for block in model.single_blocks:
-        # pyrefly: ignore [missing-attribute]
         block.compile(backend=compile_config.backend, fullgraph=True)
 
     logger.info(
@@ -152,16 +137,12 @@ def apply_compile(model: nn.Module, compile_config: CompileConfig):
 def apply_ac(model: nn.Module, ac_config):
     """Apply activation checkpointing to the model."""
 
-    # pyrefly: ignore [missing-attribute]
     for layer_id, block in model.double_blocks.named_children():
         block = ptd_checkpoint_wrapper(block, preserve_rng_state=True)
-        # pyrefly: ignore [missing-attribute]
         model.double_blocks.register_module(layer_id, block)
 
-    # pyrefly: ignore [missing-attribute]
     for layer_id, block in model.single_blocks.named_children():
         block = ptd_checkpoint_wrapper(block, preserve_rng_state=True)
-        # pyrefly: ignore [missing-attribute]
         model.single_blocks.register_module(layer_id, block)
 
     logger.info(f"Applied {ac_config.mode} activation checkpointing to the model")
@@ -183,18 +164,12 @@ def apply_cp(model: nn.Module, cp_mesh: DeviceMesh) -> None:
     # Collect all inner_attention modules from the Flux model
     attention_modules = []
 
-    # pyrefly: ignore [not-iterable]
     for double_block in model.double_blocks:
-        # pyrefly: ignore [missing-attribute]
         attention_modules.append(double_block.img_attn.inner_attention)
-        # pyrefly: ignore [missing-attribute]
         attention_modules.append(double_block.txt_attn.inner_attention)
-        # pyrefly: ignore [missing-attribute]
         attention_modules.append(double_block.inner_attention)
 
-    # pyrefly: ignore [not-iterable]
     for single_block in model.single_blocks:
-        # pyrefly: ignore [missing-attribute]
         attention_modules.append(single_block.inner_attention)
 
     # Apply CP using the shared implementation (always uses SDPA for Flux)
@@ -209,6 +184,7 @@ def parallelize_encoders(
     parallel_dims: ParallelDims,
     *,
     training: TrainingConfig,
+    enable_symm_mem: bool = False,
 ):
     mp_policy = MixedPrecisionPolicy(
         param_dtype=TORCH_DTYPE_MAP[training.mixed_precision_param],
@@ -226,17 +202,14 @@ def parallelize_encoders(
 
     # NOTE: only apply FSDP to the T5 encoder, not the CLIP text encoder.
     # CLIP Text encoder has low computation / communication ratio, so it's not necessary to apply FSDP to it.
-    # pyrefly: ignore [missing-attribute]
     for block in t5_model.hf_module.encoder.block:
         fully_shard(block, **fsdp_config)
-    # pyrefly: ignore [no-matching-overload]
     fully_shard(t5_model.hf_module, **fsdp_config)
 
     if parallelism.enable_fsdp_symm_mem:
         enable_fsdp_symm_mem(t5_model.hf_module)
 
     # Disable FSDP's automatic gradient division for all FSDP modules
-    # pyrefly: ignore [bad-argument-type]
     disable_fsdp_gradient_division(t5_model.hf_module)
 
     logger.info("Applied fully_shard to the T5 encoder model")

@@ -199,7 +199,6 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
         model_spec = config.model_spec
 
         device_module, device_type = utils.device_module, utils.device_type
-        # pyrefly: ignore [read-only]
         self.device = torch.device(f"{device_type}:{int(os.environ['LOCAL_RANK'])}")
         # Device has to be set before creating TorchFT manager.
         device_module.set_device(self.device)
@@ -750,7 +749,6 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful, Configurable):
             loss = self.forward_backward_step(
                 input_dict=input_dict,
                 labels=labels,
-                # pyrefly: ignore [bad-argument-type]
                 global_valid_tokens=global_valid_tokens,
             )
             accumulated_losses.append(loss.detach())

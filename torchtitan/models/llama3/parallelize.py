@@ -97,7 +97,6 @@ def parallelize_llama(
 
     if parallel_dims.cp_enabled:
         apply_cp_to_attention_module(
-            # pyrefly: ignore [missing-attribute, not-callable]
             [block.attention.inner_attention for block in model.layers.values()],
             parallel_dims.get_mesh("cp"),
         )
@@ -128,6 +127,7 @@ def parallelize_llama(
         pp_enabled=parallel_dims.pp_enabled,
         cpu_offload=training.enable_cpu_offload,
         reshard_after_forward_policy=parallelism.fsdp_reshard_after_forward,
+        enable_symm_mem=parallelism.enable_fsdp_symm_mem,
     )
 
     logger.info("Applied fully_shard to the model")
@@ -206,14 +206,12 @@ def apply_tp(
     )
 
     # Detect whether fused QKV is used by checking the first layer
-    # pyrefly: ignore [not-callable]
     first_block = next(iter(model.layers.values()))
     use_fused_qkv = isinstance(
-        first_block.attention.qkv_linear,  # pyrefly: ignore [missing-attribute]
+        first_block.attention.qkv_linear,
         FusedQKVLinear,
     )
 
-    # pyrefly: ignore [not-callable]
     for transformer_block in model.layers.values():
         if use_fused_qkv:
             qkv_plan = {
@@ -244,7 +242,6 @@ def apply_tp(
         }
 
         parallelize_module(
-            # pyrefly: ignore [bad-argument-type]
             module=transformer_block,
             device_mesh=tp_mesh,
             parallelize_plan=layer_plan,
@@ -264,6 +261,7 @@ def apply_fsdp(
     pp_enabled: bool,
     cpu_offload: bool = False,
     reshard_after_forward_policy: str = "default",
+    enable_symm_mem: bool = False,
 ):
     """
     Apply data parallelism (via FSDP2) to the model.
@@ -289,7 +287,6 @@ def apply_fsdp(
     )
     fsdp_config = {"mesh": dp_mesh, "mp_policy": mp_policy}
     if cpu_offload:
-        # pyrefly: ignore[bad-typed-dict-key]
         fsdp_config["offload_policy"] = CPUOffloadPolicy()
 
     reshard_after_forward = get_fsdp_reshard_after_forward_policy(
@@ -302,7 +299,6 @@ def apply_fsdp(
         modules = [
             m for m in (model.tok_embeddings, model.norm, model.output) if m is not None
         ]
-        # pyrefly: ignore [no-matching-overload]
         fully_shard(
             modules,
             **fsdp_config,
@@ -310,7 +306,6 @@ def apply_fsdp(
         )
     else:
         if model.tok_embeddings is not None:
-            # pyrefly: ignore [no-matching-overload]
             fully_shard(
                 model.tok_embeddings,
                 **fsdp_config,
@@ -319,13 +314,11 @@ def apply_fsdp(
         # As an optimization, do not reshard_after_forward the last layers by default
         # since FSDP would prefetch them immediately after the forward pass
         if model.norm is not None and model.output is not None:
-            # pyrefly: ignore [no-matching-overload]
             fully_shard(
                 [model.norm, model.output],
                 **fsdp_config,
                 reshard_after_forward=reshard_after_forward_policy == "always",
             )
-    # pyrefly: ignore [missing-attribute]
     for layer_id, transformer_block in model.layers.items():
         fully_shard(
             transformer_block,
@@ -335,7 +328,7 @@ def apply_fsdp(
 
     fully_shard(model, **fsdp_config)
 
-    if parallelism.enable_fsdp_symm_mem:
+    if enable_symm_mem:
         enable_fsdp_symm_mem(model)
 
     # Disable FSDP's automatic gradient division for all FSDP modules

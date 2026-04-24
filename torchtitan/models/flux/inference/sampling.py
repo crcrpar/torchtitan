@@ -147,7 +147,6 @@ def generate_image(
             else None
         ),
         empty_clip_encodings=(
-            # pyrefly: ignore [unbound-name]
             empty_batch["clip_encodings"]
             if enable_classifier_free_guidance
             else None
@@ -187,9 +186,7 @@ def denoise(
     if enable_classifier_free_guidance:
         # Double batch size for CFG: [unconditional, conditional]
         latents = torch.cat([latents, latents], dim=0)
-        # pyrefly: ignore [no-matching-overload]
         t5_encodings = torch.cat([empty_t5_encodings, t5_encodings], dim=0)
-        # pyrefly: ignore [no-matching-overload]
         clip_encodings = torch.cat([empty_clip_encodings, clip_encodings], dim=0)
         bsz *= 2
 

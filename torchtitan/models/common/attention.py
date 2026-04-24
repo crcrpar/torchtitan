@@ -121,7 +121,6 @@ class LocalMapInnerAttention(Module):
                     f"(n_heads dim), but got {p} at position {i}"
                 )
             # Ensure all Shard placements use the same tensor dim
-            # pyrefly: ignore [missing-attribute]
             shard_dims = {p.dim for p in q.placements}
             assert len(shard_dims) == 1, (
                 f"All Shard placements must shard on the same dim, "
@@ -141,7 +140,6 @@ class LocalMapInnerAttention(Module):
                     in_grad_placements=(q.placements, k.placements, v.placements),
                     device_mesh=q.device_mesh,
                 )
-            # pyrefly: ignore [bad-argument-count]
             return self._local_map_fn(q, k, v, **kwargs)
         return super().__call__(q, k, v, **kwargs)
 
@@ -237,7 +235,7 @@ class VarlenAttention(LocalMapInnerAttention):
             #               is_causal=False.
             #   - (W, 0): Sliding window causal - attend to at most W previous tokens.
             window_size=(-1, 0),
-            **varlen_kwargs,  # pyrefly: ignore [bad-argument-type]
+            **varlen_kwargs,
         )
         assert isinstance(out_packed, torch.Tensor)
         # Reshape back to the format expected by GQAttention.forward()
@@ -279,7 +277,6 @@ class FlexAttention(LocalMapInnerAttention):
         "triton.cudagraphs": False,
     }
 
-    # pyrefly: ignore[no-matching-overload]
     _compiled_flex_attn: ClassVar[Callable] = torch.compile(
         flex_attention,
         options=inductor_configs,
@@ -289,7 +286,6 @@ class FlexAttention(LocalMapInnerAttention):
         super().__init__(config)
         self.kernel_options = config.kernel_options
 
-    # pyrefly: ignore [bad-override]
     def forward(
         self,
         q: torch.Tensor,
@@ -534,7 +530,6 @@ def create_varlen_metadata_for_document(
     if len(all_seq_lengths) > 0:
         all_seq_lengths = torch.cat(all_seq_lengths)
         # device to host sync but only done once per model forward
-        # pyrefly: ignore[bad-assignment]
         max_seqlen = all_seq_lengths.max().item()
 
     return VarlenMetadata(

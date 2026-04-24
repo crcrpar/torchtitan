@@ -94,12 +94,12 @@ class NoParallel(ParallelStyle):
             device_mesh,
             None,
             partial(
-                self._prepare_input_fn,  # pyrefly: ignore [bad-argument-type]
+                self._prepare_input_fn,
                 self.input_layout,
                 self.desired_input_layout,
             ),
             partial(
-                self._prepare_output_fn,  # pyrefly: ignore [bad-argument-type]
+                self._prepare_output_fn,
                 self.output_layout,
                 self.local_output_grad_placements,
             ),
@@ -134,7 +134,7 @@ class ColwiseParallelWithGradPlacement(ColwiseParallel):
         self.local_input_grad_placements = local_input_grad_placements
 
     @staticmethod
-    def _prepare_input_fn(  # pyrefly: ignore [bad-param-name-override]
+    def _prepare_input_fn(
         input_layouts,
         desired_input_layouts,
         local_input_grad_placements,
@@ -177,7 +177,7 @@ class ColwiseParallelWithGradPlacement(ColwiseParallel):
             device_mesh,
             partition_fn,
             partial(
-                self._prepare_input_fn,  # pyrefly: ignore [bad-argument-type]
+                self._prepare_input_fn,
                 self.input_layouts,
                 self.desired_input_layouts,
                 self.local_input_grad_placements,
