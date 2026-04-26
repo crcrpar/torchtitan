@@ -103,6 +103,7 @@ def parallelize_qwen3(
 
     if parallel_dims.cp_enabled:
         apply_cp_to_attention_module(
+            # pyrefly: ignore [missing-attribute, not-callable]
             [block.attention.inner_attention for block in model.layers.values()],
             parallel_dims.get_mesh("cp"),
         )
@@ -222,12 +223,14 @@ def apply_non_moe_tp(
     qk_norm_plan = SequenceParallel(sequence_dim=2, use_local_output=False)
 
     # Detect whether fused QKV is used by checking the first layer
+    # pyrefly: ignore [not-callable]
     first_block = next(iter(model.layers.values()))
     use_fused_qkv = isinstance(
-        first_block.attention.qkv_linear,
+        first_block.attention.qkv_linear,  # pyrefly: ignore [missing-attribute]
         FusedQKVLinear,
     )
 
+    # pyrefly: ignore [not-callable]
     for transformer_block in model.layers.values():
         if use_fused_qkv:
             qkv_plan = {
@@ -261,6 +264,7 @@ def apply_non_moe_tp(
             "ffn_norm": norm_plan,
         }
 
+        # pyrefly: ignore [missing-attribute]
         if not transformer_block.moe_enabled:
             layer_plan.update(
                 {
@@ -277,6 +281,7 @@ def apply_non_moe_tp(
             )
 
         parallelize_module(
+            # pyrefly: ignore [bad-argument-type]
             module=transformer_block,
             device_mesh=tp_mesh,
             parallelize_plan=layer_plan,

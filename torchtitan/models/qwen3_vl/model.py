@@ -226,6 +226,7 @@ class Qwen3VLModel(Qwen3Model):
                 pair_cursor = doc_start
                 for vision_start in doc_vision_starts:
                     if sample_tokens[vision_start] == image_token_id:
+                        # pyrefly: ignore [unsupported-operation]
                         t, h, w = grid_thw[image_index]
                         image_index += 1
                     else:
@@ -257,23 +258,28 @@ class Qwen3VLModel(Qwen3Model):
                         t_index = (
                             torch.arange(llm_grid_t)
                             .view(-1, 1)
+                            # pyrefly: ignore [no-matching-overload]
                             .expand(-1, llm_grid_h * llm_grid_w)
                             .flatten()
                         )
                         h_index = (
                             torch.arange(llm_grid_h)
                             .view(1, -1, 1)
+                            # pyrefly: ignore [no-matching-overload]
                             .expand(llm_grid_t, -1, llm_grid_w)
                             .flatten()
                         )
                         w_index = (
                             torch.arange(llm_grid_w)
                             .view(1, 1, -1)
+                            # pyrefly: ignore [no-matching-overload]
                             .expand(llm_grid_t, llm_grid_h, -1)
                             .flatten()
                         )
+                        # pyrefly: ignore [unsupported-operation]
                         grid_cache[grid_key] = torch.stack([t_index, h_index, w_index])
                     doc_pos_ids_list.append(
+                        # pyrefly: ignore [bad-index]
                         grid_cache[grid_key]
                         + text_len
                         + pos_id_offset
@@ -527,6 +533,7 @@ class Qwen3VLModel(Qwen3Model):
             deepstack_vision_embeds = []
             image_mask_joint = image_mask[vision_pos_masks]
             video_mask_joint = video_mask[vision_pos_masks]
+            # pyrefly: ignore [no-matching-overload]
             for image_embed, video_embed in zip(
                 deepstack_image_embeds, deepstack_video_embeds
             ):
@@ -545,7 +552,7 @@ class Qwen3VLModel(Qwen3Model):
 
         return inputs_embeds, vision_pos_masks, deepstack_vision_embeds
 
-    def forward(  # pyrefly: ignore [bad-override]
+    def forward(  # pyrefly: ignore [bad-override, bad-param-name-override]
         self,
         tokens: torch.Tensor,
         *,

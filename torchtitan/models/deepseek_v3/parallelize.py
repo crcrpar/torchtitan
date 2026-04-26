@@ -110,6 +110,7 @@ def parallelize_deepseekv3(
 
     if parallel_dims.cp_enabled:
         apply_cp_to_attention_module(
+            # pyrefly: ignore [missing-attribute, not-callable]
             [block.attention.inner_attention for block in model.layers.values()],
             parallel_dims.get_mesh("cp"),
         )
@@ -221,6 +222,7 @@ def apply_non_moe_tp(
         output_layouts=sp_layout, use_local_output=False
     )
 
+    # pyrefly: ignore [not-callable]
     for transformer_block in model.layers.values():
         layer_plan = {
             "attention_norm": norm_plan,
@@ -245,6 +247,7 @@ def apply_non_moe_tp(
             "ffn_norm": norm_plan,
         }
 
+        # pyrefly: ignore [missing-attribute]
         if transformer_block.attention.q_lora_rank == 0:
             layer_plan["attention.wq"] = colwise_parallel(
                 use_local_output=False
@@ -258,6 +261,7 @@ def apply_non_moe_tp(
                 }
             )
 
+        # pyrefly: ignore [missing-attribute]
         if not transformer_block.moe_enabled:
             layer_plan.update(
                 {
@@ -272,8 +276,10 @@ def apply_non_moe_tp(
             )
 
         parallelize_module(
+            # pyrefly: ignore [bad-argument-type]
             module=transformer_block,
             device_mesh=tp_mesh,
+            # pyrefly: ignore [bad-argument-type]
             parallelize_plan=layer_plan,
         )
 

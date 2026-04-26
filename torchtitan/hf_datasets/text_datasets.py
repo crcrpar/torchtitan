@@ -411,6 +411,7 @@ class ChatDataset(IterableDataset, Stateful):
         """
         while True:
             for sample in self._get_data_iter():
+                # pyrefly: ignore [bad-argument-type]
                 result = self._tokenize_sample(sample)
                 if result is None:
                     self._sample_idx += 1

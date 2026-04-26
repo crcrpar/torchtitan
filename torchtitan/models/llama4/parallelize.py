@@ -139,6 +139,7 @@ def parallelize_llama(
 
     if parallel_dims.cp_enabled:
         apply_cp_to_attention_module(
+            # pyrefly: ignore [missing-attribute, not-callable]
             [block.attention.inner_attention for block in model.layers.values()],
             parallel_dims.get_mesh("cp"),
         )
@@ -254,12 +255,14 @@ def apply_non_moe_tp(
     norm_plan = SequenceParallel(use_local_output=False) if enable_sp else NoParallel()
 
     # Detect whether fused QKV is used by checking the first layer
+    # pyrefly: ignore [not-callable]
     first_block = next(iter(model.layers.values()))
     use_fused_qkv = isinstance(
-        first_block.attention.qkv_linear,
+        first_block.attention.qkv_linear,  # pyrefly: ignore [missing-attribute]
         FusedQKVLinear,
     )
 
+    # pyrefly: ignore [not-callable]
     for transformer_block in model.layers.values():
         if use_fused_qkv:
             qkv_plan = {
@@ -283,6 +286,7 @@ def apply_non_moe_tp(
             ),
             "ffn_norm": norm_plan,
         }
+        # pyrefly: ignore [missing-attribute]
         if not transformer_block.moe_enabled:
             layer_plan.update(
                 {
@@ -299,6 +303,7 @@ def apply_non_moe_tp(
             )
 
         parallelize_module(
+            # pyrefly: ignore [bad-argument-type]
             module=transformer_block,
             device_mesh=tp_mesh,
             parallelize_plan=layer_plan,
@@ -356,6 +361,7 @@ def apply_fsdp(
         modules = [
             m for m in (model.tok_embeddings, model.norm, model.output) if m is not None
         ]
+        # pyrefly: ignore [no-matching-overload]
         fully_shard(
             modules,
             **fsdp_config,
@@ -363,6 +369,7 @@ def apply_fsdp(
         )
     else:
         if model.tok_embeddings is not None:
+            # pyrefly: ignore [no-matching-overload]
             fully_shard(
                 model.tok_embeddings,
                 **fsdp_config,
@@ -371,12 +378,14 @@ def apply_fsdp(
         if model.norm is not None and model.output is not None:
             # As an optimization, do not reshard_after_forward the last layers by default
             # since FSDP would prefetch them immediately after the forward pass
+            # pyrefly: ignore [no-matching-overload]
             fully_shard(
                 [model.norm, model.output],
                 **fsdp_config,
                 reshard_after_forward=reshard_after_forward_policy == "always",
             )
 
+    # pyrefly: ignore [missing-attribute]
     for layer_id, transformer_block in model.layers.items():
         # NOTE: In an MoE layer, we use shard_placement_fn to apply different
         # FSDP mesh and shard placement to different parameters:
@@ -477,35 +486,45 @@ def apply_fsdp(
         return
 
     # forward
+    # pyrefly: ignore [not-callable]
     transformer_blocks = list(model.layers.values())
     next_transformer_blocks = transformer_blocks[1:] + [None]
 
+    # pyrefly: ignore [bad-argument-type]
     if model.tok_embeddings is not None and len(model.layers) > 0:
+        # pyrefly: ignore [missing-attribute]
         model.tok_embeddings.set_modules_to_forward_prefetch([transformer_blocks[0]])
 
     for transformer_block, next_transformer_block in zip(
         transformer_blocks, next_transformer_blocks
     ):
         if next_transformer_block is not None:
+            # pyrefly: ignore [missing-attribute]
             transformer_block.set_modules_to_forward_prefetch([next_transformer_block])
         elif model.norm is not None and model.output is not None:
+            # pyrefly: ignore [missing-attribute]
             transformer_block.set_modules_to_forward_prefetch(
                 [model.norm, model.output]
             )
 
     # backward
+    # pyrefly: ignore [not-callable]
     reversed_transformer_blocks = list(reversed(model.layers.values()))
     prev_transformer_blocks = reversed_transformer_blocks[1:] + [None]
 
+    # pyrefly: ignore [bad-argument-type]
     if model.norm is not None and model.output is not None and len(model.layers) > 0:
+        # pyrefly: ignore [missing-attribute]
         model.output.set_modules_to_backward_prefetch([reversed_transformer_blocks[0]])
 
     for transformer_block, prev_transformer_block in zip(
         reversed_transformer_blocks, prev_transformer_blocks
     ):
         if prev_transformer_block is not None:
+            # pyrefly: ignore [missing-attribute]
             transformer_block.set_modules_to_backward_prefetch([prev_transformer_block])
         elif model.tok_embeddings is not None:
+            # pyrefly: ignore [missing-attribute]
             transformer_block.set_modules_to_backward_prefetch([model.tok_embeddings])
 
 
@@ -536,7 +555,9 @@ def apply_moe_ep_tp(
 
     sp_layout = Shard(1) if enable_sp else Replicate()
 
+    # pyrefly: ignore [not-callable]
     for transformer_block in model.layers.values():
+        # pyrefly: ignore [missing-attribute]
         if not transformer_block.moe_enabled:
             continue
 
@@ -559,6 +580,7 @@ def apply_moe_ep_tp(
                     local_output_grad_placements=(Partial(),),
                 ),
             }
+            # pyrefly: ignore [missing-attribute]
             if transformer_block.moe.shared_experts is not None:
                 # Use ColwiseParallelWithGradPlacement to keep d_x as Partial in
                 # backward (avoids the all-reduce that from_local(Replicate)
@@ -566,6 +588,7 @@ def apply_moe_ep_tp(
                 # skips the Partial→Replicate all-reduce in forward. The
                 # reduction happens once at the MoE output boundary
                 # (PrepareModuleInputOutput).
+                # pyrefly: ignore [no-matching-overload]
                 moe_layer_plan.update(
                     {
                         "moe.shared_experts.w1": ColwiseParallelWithGradPlacement(
@@ -580,8 +603,10 @@ def apply_moe_ep_tp(
                     }
                 )
             parallelize_module(
+                # pyrefly: ignore [bad-argument-type]
                 module=transformer_block,
                 device_mesh=tp_mesh,
+                # pyrefly: ignore [bad-argument-type]
                 parallelize_plan=moe_layer_plan,
             )
 
@@ -595,6 +620,7 @@ def apply_moe_ep_tp(
             assert ep_etp_mesh is None
             experts_mesh = ep_mesh
             if comm_backend in ("deepep", "hybridep"):
+                # pyrefly: ignore [missing-attribute]
                 dispatcher = transformer_block.moe.experts.token_dispatcher
                 assert isinstance(dispatcher, DeepEPTokenDispatcher)
                 if comm_backend == "deepep" and pad_multiple is not None:
@@ -607,6 +633,7 @@ def apply_moe_ep_tp(
             # sp_size and sp_rank are set for sequence-parallel token splitting
             # when EP borrows from TP (ETP=1).
             experts_plan = ExpertParallel()
+            # pyrefly: ignore [missing-attribute]
             dispatcher = transformer_block.moe.experts.token_dispatcher
             if tp_mesh is not None:
                 if isinstance(dispatcher, AllToAllTokenDispatcher):
@@ -621,6 +648,7 @@ def apply_moe_ep_tp(
                 ), "pad_multiple must be set for TorchAOTokenDispatcher"
                 dispatcher.pad_multiple = pad_multiple
         else:
+            # pyrefly: ignore [missing-attribute]
             dispatcher = transformer_block.moe.experts.token_dispatcher
             if isinstance(dispatcher, TorchAOTokenDispatcher):
                 raise NotImplementedError(
@@ -632,6 +660,7 @@ def apply_moe_ep_tp(
             experts_plan = ExpertTensorParallel()
 
         parallelize_module(
+            # pyrefly: ignore [missing-attribute]
             module=transformer_block.moe.experts,
             device_mesh=experts_mesh,
             parallelize_plan=experts_plan,

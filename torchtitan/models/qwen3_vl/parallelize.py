@@ -74,15 +74,18 @@ def _apply_non_moe_tp_to_decoder(
             use_local_output=not loss_parallel,
         ),
     }
+    # pyrefly: ignore [bad-argument-type]
     parallelize_module(model, tp_mesh, top_level_plan)
 
     # Detect whether fused QKV is used by checking the first layer
+    # pyrefly: ignore [not-callable]
     first_block = next(iter(model.layers.values()))
     use_fused_qkv = isinstance(
-        first_block.attention.qkv_linear,
+        first_block.attention.qkv_linear,  # pyrefly: ignore [missing-attribute]
         FusedQKVLinear,
     )
 
+    # pyrefly: ignore [not-callable]
     for transformer_block in model.layers.values():
         if use_fused_qkv:
             qkv_plan = {
@@ -100,7 +103,7 @@ def _apply_non_moe_tp_to_decoder(
         # inside each block (for TP/EP) while returning plain tensors
         # between blocks for DeepStack boolean indexing.
         parallelize_module(
-            transformer_block,
+            transformer_block,  # pyrefly: ignore [bad-argument-type]
             tp_mesh,
             PrepareModuleInputOutput(
                 input_layouts=(Replicate(), Replicate(), None, None),
@@ -131,6 +134,7 @@ def _apply_non_moe_tp_to_decoder(
             ),
         }
 
+        # pyrefly: ignore [missing-attribute]
         if not transformer_block.moe_enabled:
             layer_plan.update(
                 {
@@ -144,8 +148,10 @@ def _apply_non_moe_tp_to_decoder(
             )
 
         parallelize_module(
+            # pyrefly: ignore [bad-argument-type]
             module=transformer_block,
             device_mesh=tp_mesh,
+            # pyrefly: ignore [bad-argument-type]
             parallelize_plan=layer_plan,
         )
 
@@ -185,6 +191,7 @@ def _apply_tp_to_vision_encoder(
     # on tp_mesh for FSDP mesh consistency. The vision encoder's
     # compute_position_embeddings uses local_map to unwrap it for interpolation.
     vision_encoder.pos_embed = nn.Parameter(
+        # pyrefly: ignore [bad-argument-type]
         distribute_tensor(vision_encoder.pos_embed.data, tp_mesh, [Replicate()]),
         requires_grad=vision_encoder.pos_embed.requires_grad,
     )
@@ -206,7 +213,9 @@ def _apply_tp_to_vision_encoder(
         "mlp.linear_fc2": RowwiseParallel(use_local_output=False),
     }
 
+    # pyrefly: ignore [not-callable]
     for transformer_block in vision_encoder.layers.values():
+        # pyrefly: ignore [bad-argument-type]
         parallelize_module(transformer_block, tp_mesh, layer_plan)
 
     # TP plan for patch mergers (main + deepstack).
@@ -219,8 +228,11 @@ def _apply_tp_to_vision_encoder(
         "linear_fc2": RowwiseParallel(),
     }
 
+    # pyrefly: ignore [bad-argument-type]
     parallelize_module(vision_encoder.merger, tp_mesh, merger_plan)
+    # pyrefly: ignore [not-iterable]
     for merger in vision_encoder.deepstack_merger_list:
+        # pyrefly: ignore [bad-argument-type]
         parallelize_module(merger, tp_mesh, merger_plan)
 
     logger.info("Applied Tensor Parallelism to the vision encoder")
@@ -292,6 +304,7 @@ def parallelize_qwen3_vl(
 
         # Apply TP to vision encoder
         if model.vision_encoder is not None:
+            # pyrefly: ignore [bad-argument-type]
             _apply_tp_to_vision_encoder(model.vision_encoder, tp_mesh)
 
         # Apply TP to decoder without SequenceParallel.
@@ -327,6 +340,7 @@ def parallelize_qwen3_vl(
             base_folder=dump_folder,
         )
         if model.vision_encoder is not None:
+            # pyrefly: ignore [bad-argument-type]
             apply_ac(model.vision_encoder, ac_config)
 
     # Apply torch.compile after AC wrapping and before FSDP
@@ -334,6 +348,7 @@ def parallelize_qwen3_vl(
         apply_compile(model, compile_config)
     if compile_config.enable:
         if model.vision_encoder is not None:
+            # pyrefly: ignore [bad-argument-type]
             apply_compile(model.vision_encoder, compile_config)
 
     # Apply FSDP / HSDP unconditionally (fully_shard handles dp_shard=1)
@@ -355,6 +370,7 @@ def parallelize_qwen3_vl(
     # FSDP the vision encoder as a single unit (see _apply_fsdp_to_vision_encoder)
     if model.vision_encoder is not None:
         _apply_fsdp_to_vision_encoder(
+            # pyrefly: ignore [bad-argument-type]
             model.vision_encoder,
             dp_mesh,
             param_dtype=TORCH_DTYPE_MAP[training.mixed_precision_param],

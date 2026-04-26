@@ -109,6 +109,7 @@ def parallelize_gptoss(
 
     if parallel_dims.cp_enabled:
         apply_cp_to_attention_module(
+            # pyrefly: ignore [missing-attribute, not-callable]
             [block.attention.inner_attention for block in model.layers.values()],
             parallel_dims.get_mesh("cp"),
         )
@@ -205,12 +206,14 @@ def apply_non_moe_tp(
     )
 
     # Detect whether fused QKV is used by checking the first layer
+    # pyrefly: ignore [not-callable]
     first_block = next(iter(model.layers.values()))
     use_fused_qkv = isinstance(
-        first_block.attention.qkv_linear,
+        first_block.attention.qkv_linear,  # pyrefly: ignore [missing-attribute]
         FusedQKVLinear,
     )
 
+    # pyrefly: ignore [not-callable]
     for transformer_block in model.layers.values():
         if use_fused_qkv:
             qkv_plan = {
@@ -234,6 +237,7 @@ def apply_non_moe_tp(
         }
 
         # shard attention.sinks across heads
+        # pyrefly: ignore [missing-attribute]
         attn = transformer_block.attention
         attn.register_parameter(
             "sinks",
@@ -241,8 +245,10 @@ def apply_non_moe_tp(
         )
 
         parallelize_module(
+            # pyrefly: ignore [bad-argument-type]
             module=transformer_block,
             device_mesh=tp_mesh,
+            # pyrefly: ignore [bad-argument-type]
             parallelize_plan=layer_plan,
         )
 
@@ -268,7 +274,9 @@ def apply_moe_ep_tp(
 
     sp_layout = Shard(1) if enable_sp else Replicate()
 
+    # pyrefly: ignore [not-callable]
     for transformer_block in model.layers.values():
+        # pyrefly: ignore [missing-attribute]
         if not transformer_block.moe_enabled:
             continue
 
@@ -292,8 +300,10 @@ def apply_moe_ep_tp(
                 ),
             }
             parallelize_module(
+                # pyrefly: ignore [bad-argument-type]
                 module=transformer_block,
                 device_mesh=tp_mesh,
+                # pyrefly: ignore [bad-argument-type]
                 parallelize_plan=moe_layer_plan,
             )
 
@@ -307,6 +317,7 @@ def apply_moe_ep_tp(
             # sp_size and sp_rank are set for sequence-parallel token splitting
             # when EP borrows from TP (ETP=1).
             experts_plan = ExpertParallel()
+            # pyrefly: ignore [missing-attribute]
             dispatcher = transformer_block.moe.experts.token_dispatcher
             if tp_mesh is not None:
                 if isinstance(dispatcher, AllToAllTokenDispatcher):
@@ -321,6 +332,7 @@ def apply_moe_ep_tp(
                 ), "pad_multiple must be set for TorchAOTokenDispatcher"
                 dispatcher.pad_multiple = pad_multiple
         else:
+            # pyrefly: ignore [missing-attribute]
             dispatcher = transformer_block.moe.experts.token_dispatcher
             if isinstance(dispatcher, TorchAOTokenDispatcher):
                 raise NotImplementedError(
@@ -331,6 +343,7 @@ def apply_moe_ep_tp(
             experts_plan = GptossExpertTensorParallel()
 
         parallelize_module(
+            # pyrefly: ignore [missing-attribute]
             module=transformer_block.moe.experts,
             device_mesh=experts_mesh,
             parallelize_plan=experts_plan,
