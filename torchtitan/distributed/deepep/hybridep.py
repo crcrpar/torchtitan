@@ -367,7 +367,6 @@ def get_buffer(
 
     try:
         # pyrefly: ignore [missing-import, missing-module-attribute]
-        # pyrefly: ignore [missing-import]
         from deep_ep import HybridEPBuffer
     except ImportError as e:
         raise ImportError(
