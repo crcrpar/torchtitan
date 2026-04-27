@@ -114,6 +114,7 @@ class OptimizersContainer(Optimizer, Stateful, Configurable, Generic[T]):
             "fused",
             "fused_opt_states_bf16",
             "cpp_wrapper_foreach",
+            "cpp_wrapper_foreach_opt_states_bf16",
         ] = "fused"
         """
         Specify which optimizer implementation to use:
@@ -160,6 +161,7 @@ class OptimizersContainer(Optimizer, Stateful, Configurable, Generic[T]):
             "for-loop",
             "fused_opt_states_bf16",
             "cpp_wrapper_foreach",
+            "cpp_wrapper_foreach_opt_states_bf16",
         ]
         fused = config.implementation in ("fused", "fused_opt_states_bf16")
         return {
@@ -168,7 +170,7 @@ class OptimizersContainer(Optimizer, Stateful, Configurable, Generic[T]):
             "eps": config.eps,
             "weight_decay": config.weight_decay,
             "fused": fused,
-            "foreach": config.implementation.endswith("foreach"),
+            "foreach": "foreach" in config.implementation,
         }
 
     @staticmethod
@@ -245,12 +247,12 @@ class OptimizersContainer(Optimizer, Stateful, Configurable, Generic[T]):
             self.optimizers.append(optimizer_cls(param_groups))
             for group in param_groups:
                 all_params.extend(group["params"])
-        if config.implementation == "fused_opt_states_bf16":
+        if config.implementation.endswith("fused_opt_states_bf16"):
             self._register_bf16_optimizer_state_hook()
         self._validate_length(len(self.model_parts))
         self._post_init(all_params, optimizer_kwargs)
 
-        if config.implementation == "cpp_wrapper_foreach":
+        if config.implementation.startwith("cpp_wrapper_foreach"):
             for optimizer in self.optimizers:
                 optimizer.step = torch.compile(
                     optimizer.step, options={"cpp_wrapper": True}
@@ -364,9 +366,9 @@ class OptimizersInBackwardContainer(OptimizersContainer):
                     "implementation='fused_opt_states_bf16' is not supported with "
                     "OptimizersInBackwardContainer"
                 )
-            if self.implementation == "cpp_wrapper_foreach":
+            if self.implementation.startswith("cpp_wrapper_foreach"):
                 raise ValueError(
-                    "implementation='cpp_wrapper_foraech' is not supported with OptimizerInBackwardContainer"
+                    f"implementation='{self.implementation}' is not supported with OptimizerInBackwardContainer"
                 )
             OptimizersContainer.Config.__post_init__(self)
 
