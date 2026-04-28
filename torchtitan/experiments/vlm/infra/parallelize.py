@@ -91,6 +91,7 @@ def parallelize_vlm(
         cpu_offload=training.enable_cpu_offload,
         reshard_after_forward_policy=parallelism.fsdp_reshard_after_forward,
         enable_symm_mem=parallelism.enable_fsdp_symm_mem,
+        force_sum_reduction_for_comms=parallelism.enable_fsdp_force_sum_reduction_for_comms,
     )
 
     logger.info("Applied fully_shard to the model")
@@ -113,6 +114,7 @@ def apply_fsdp(
     cpu_offload: bool = False,
     reshard_after_forward_policy: str = "default",
     enable_symm_mem: bool = False,
+    force_sum_reduction_for_comms: bool = False,
 ):
     """
     Apply data parallelism (via FSDP2) to the model.
@@ -130,6 +132,7 @@ def apply_fsdp(
             - "always" will enable `reshard_after_forward` for all forward passes.
             - "never" will disable `reshard_after_forward` for all forward passes.
         enable_symm_mem (bool, optional): Whether to enable symmetric-memory FSDP communication.
+        force_sum_reduction_for_comms (bool, optional): Whether to force FSDP communication to use sum-type reductions.
     """
     mp_policy = MixedPrecisionPolicy(param_dtype=param_dtype, reduce_dtype=reduce_dtype)
     fsdp_config = {"mesh": dp_mesh, "mp_policy": mp_policy}
@@ -169,7 +172,10 @@ def apply_fsdp(
     fully_shard(model, **fsdp_config)
 
     if enable_symm_mem:
-        enable_fsdp_symm_mem(model)
+        enable_fsdp_symm_mem(
+            model,
+            force_sum_reduction_for_comms=force_sum_reduction_for_comms,
+        )
 
     # Disable FSDP's automatic gradient division for all FSDP modules
     disable_fsdp_gradient_division(model)

@@ -25,7 +25,9 @@ def disable_fsdp_gradient_division(model: nn.Module) -> None:
             module.set_gradient_divide_factor(1.0)
 
 
-def enable_fsdp_symm_mem(model: nn.Module) -> None:
+def enable_fsdp_symm_mem(
+    model: nn.Module, *, force_sum_reduction_for_comms: bool = False
+) -> None:
     """
     Enable symmetric-memory communication optimizations for all FSDP modules.
     """
@@ -35,6 +37,7 @@ def enable_fsdp_symm_mem(model: nn.Module) -> None:
             # via torchao. That path customizes FSDP communication behavior, so
             # this combination may need extra validation when both are enabled.
             module.set_symm_mem_for_comm()
+            module.set_force_sum_reduction_for_comms(force_sum_reduction_for_comms)
 
 
 def get_fsdp_reshard_after_forward_policy(

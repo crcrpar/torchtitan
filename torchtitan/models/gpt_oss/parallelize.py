@@ -150,6 +150,7 @@ def parallelize_gptoss(
         ep_degree=parallel_dims.ep,
         edp_mesh=edp_mesh,
         enable_symm_mem=parallelism.enable_fsdp_symm_mem,
+        force_sum_reduction_for_comms=parallelism.enable_fsdp_force_sum_reduction_for_comms,
     )
 
     logger.info("Applied fully_shard to the model")

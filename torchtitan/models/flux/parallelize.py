@@ -61,6 +61,7 @@ def parallelize_flux(
         reduce_dtype=TORCH_DTYPE_MAP[training.mixed_precision_reduce],
         cpu_offload=training.enable_cpu_offload,
         enable_symm_mem=parallelism.enable_fsdp_symm_mem,
+        force_sum_reduction_for_comms=parallelism.enable_fsdp_force_sum_reduction_for_comms,
     )
 
     logger.info("Applied fully_shard to the model")
@@ -75,6 +76,7 @@ def apply_fsdp(
     reduce_dtype: torch.dtype,
     cpu_offload: bool = False,
     enable_symm_mem: bool = False,
+    force_sum_reduction_for_comms: bool = False,
 ):
     """
     Apply data parallelism (via FSDP2) to the model.
@@ -86,6 +88,7 @@ def apply_fsdp(
         reduce_dtype (torch.dtype): The data type to use for reduction operations.
         cpu_offload (bool): Whether to offload model parameters to CPU. Defaults to False.
         enable_symm_mem (bool): Whether to enable symmetric-memory FSDP communication.
+        force_sum_reduction_for_comms (bool): Whether to force FSDP communication to use sum-type reductions.
     """
     mp_policy = MixedPrecisionPolicy(param_dtype=param_dtype, reduce_dtype=reduce_dtype)
     fsdp_config: dict[str, Any] = {"mesh": dp_mesh, "mp_policy": mp_policy}
@@ -126,7 +129,10 @@ def apply_fsdp(
     fully_shard(model, **fsdp_config)
 
     if enable_symm_mem:
-        enable_fsdp_symm_mem(model)
+        enable_fsdp_symm_mem(
+            model,
+            force_sum_reduction_for_comms=force_sum_reduction_for_comms,
+        )
 
     # Disable FSDP's automatic gradient division for all FSDP modules
     disable_fsdp_gradient_division(model)
@@ -213,6 +219,7 @@ def parallelize_encoders(
     *,
     training: TrainingConfig,
     enable_symm_mem: bool = False,
+    force_sum_reduction_for_comms: bool = False,
 ):
     mp_policy = MixedPrecisionPolicy(
         param_dtype=TORCH_DTYPE_MAP[training.mixed_precision_param],
@@ -237,7 +244,10 @@ def parallelize_encoders(
     fully_shard(t5_model.hf_module, **fsdp_config)
 
     if enable_symm_mem:
-        enable_fsdp_symm_mem(t5_model.hf_module)
+        enable_fsdp_symm_mem(
+            t5_model.hf_module,
+            force_sum_reduction_for_comms=force_sum_reduction_for_comms,
+        )
 
     # Disable FSDP's automatic gradient division for all FSDP modules
     # pyrefly: ignore [bad-argument-type]

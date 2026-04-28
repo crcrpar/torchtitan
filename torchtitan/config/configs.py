@@ -126,6 +126,12 @@ class ParallelismConfig:
     all FSDP modules after `fully_shard` has been applied.
     """
 
+    enable_fsdp_force_sum_reduction_for_comms: bool = False
+    """
+    Whether to force FSDP communication to use sum-type reductions. This only
+    takes effect when `enable_fsdp_symm_mem` is enabled.
+    """
+
     tensor_parallel_degree: int = 1
     """Tensor Parallelism degree. 1 means disabled."""
 
