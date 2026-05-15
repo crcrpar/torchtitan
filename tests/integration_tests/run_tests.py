@@ -10,7 +10,9 @@ import subprocess
 import sys
 import threading
 import time
+import xml.etree.ElementTree as ET
 from concurrent.futures import Future, ThreadPoolExecutor
+from dataclasses import dataclass
 
 from torchtitan.tools.logging import logger
 
@@ -29,6 +31,15 @@ _TEST_SUITES_FUNCTION = {
 # Held while a test writes its captured output so concurrent tests do not
 # interleave their lines.
 _OUTPUT_LOCK = threading.Lock()
+
+
+@dataclass
+class IntegrationTestReport:
+    name: str
+    description: str
+    elapsed_time: float = 0.0
+    failure_message: str | None = None
+    skipped_message: str | None = None
 
 
 class GPUPool:
@@ -184,6 +195,109 @@ def run_single_test(
             )
 
 
+def _run_test_for_report(
+    test_flavor: OverrideDefinitions,
+    output_dir: str,
+    module: str | None = None,
+    config: str | None = None,
+    gpu_ids: list[int] | None = None,
+) -> IntegrationTestReport:
+    start = time.monotonic()
+    try:
+        run_single_test(test_flavor, output_dir, module, config, gpu_ids)
+        return IntegrationTestReport(
+            name=test_flavor.test_name,
+            description=test_flavor.test_descr,
+            elapsed_time=time.monotonic() - start,
+        )
+    except Exception as e:
+        return IntegrationTestReport(
+            name=test_flavor.test_name,
+            description=test_flavor.test_descr,
+            elapsed_time=time.monotonic() - start,
+            failure_message=str(e),
+        )
+
+
+def _xml_safe(text: str) -> str:
+    return "".join(ch if ch in "\t\n\r" or ord(ch) >= 0x20 else "\uFFFD" for ch in text)
+
+
+def _write_junit_xml_report(
+    xml_dir: str,
+    test_suite: str,
+    reports: list[IntegrationTestReport],
+) -> None:
+    os.makedirs(xml_dir, exist_ok=True)
+
+    num_failures = sum(report.failure_message is not None for report in reports)
+    num_skipped = sum(report.skipped_message is not None for report in reports)
+    elapsed_time = sum(report.elapsed_time for report in reports)
+    suite_name = f"torchtitan.integration.{test_suite}"
+
+    testsuites = ET.Element(
+        "testsuites",
+        {
+            "name": "torchtitan.integration",
+            "tests": str(len(reports)),
+            "failures": str(num_failures),
+            "errors": "0",
+            "skipped": str(num_skipped),
+            "time": f"{elapsed_time:.6f}",
+        },
+    )
+    testsuite = ET.SubElement(
+        testsuites,
+        "testsuite",
+        {
+            "name": suite_name,
+            "tests": str(len(reports)),
+            "failures": str(num_failures),
+            "errors": "0",
+            "skipped": str(num_skipped),
+            "time": f"{elapsed_time:.6f}",
+        },
+    )
+
+    for report in reports:
+        testcase = ET.SubElement(
+            testsuite,
+            "testcase",
+            {
+                "classname": suite_name,
+                "name": _xml_safe(report.name),
+                "time": f"{report.elapsed_time:.6f}",
+            },
+        )
+        ET.SubElement(testcase, "properties")
+        ET.SubElement(testcase, "system-out").text = _xml_safe(report.description)
+        if report.failure_message is not None:
+            failure_summary = report.failure_message.splitlines()
+            failure = ET.SubElement(
+                testcase,
+                "failure",
+                {
+                    "message": _xml_safe(
+                        failure_summary[0] if failure_summary else "test failed"
+                    ),
+                    "type": "RuntimeError",
+                },
+            )
+            failure.text = _xml_safe(report.failure_message)
+        if report.skipped_message is not None:
+            skipped = ET.SubElement(
+                testcase,
+                "skipped",
+                {"message": _xml_safe(report.skipped_message)},
+            )
+            skipped.text = _xml_safe(report.skipped_message)
+
+    tree = ET.ElementTree(testsuites)
+    xml_path = os.path.join(xml_dir, f"TEST-torchtitan-integration-{test_suite}.xml")
+    tree.write(xml_path, encoding="utf-8", xml_declaration=True)
+    logger.info(f"Wrote JUnit XML report to {xml_path}")
+
+
 def _filter_tests(
     args, test_list: list[OverrideDefinitions]
 ) -> tuple[list[OverrideDefinitions], list[OverrideDefinitions]]:
@@ -229,7 +343,16 @@ def run_tests(
             f" because --ngpu arg is {args.ngpu}"
         )
 
-    failed_tests: list[tuple[str, str]] = []
+    test_reports = [
+        IntegrationTestReport(
+            name=test_flavor.test_name,
+            description=test_flavor.test_descr,
+            skipped_message=(
+                f"requires {test_flavor.ngpu} GPUs, but --ngpu is {args.ngpu}"
+            ),
+        )
+        for test_flavor in skipped_ngpu
+    ]
 
     if parallel and runnable:
         # Schedule tests concurrently, packing them onto a fixed pool of
@@ -245,14 +368,14 @@ def run_tests(
         # Worst case: every test wants 1 GPU and runs in parallel.
         max_workers = max(1, min(len(scheduled), args.ngpu))
 
-        def _runner(test_flavor: OverrideDefinitions) -> None:
+        def _runner(test_flavor: OverrideDefinitions) -> IntegrationTestReport:
             gpus = pool.acquire(test_flavor.ngpu)
             logger.info(
                 f"[parallel] {test_flavor.test_name}: acquired GPUs {gpus} "
                 f"(ngpu={test_flavor.ngpu})"
             )
             try:
-                run_single_test(
+                return _run_test_for_report(
                     test_flavor, args.output_dir, module, config, gpu_ids=gpus
                 )
             finally:
@@ -266,19 +389,32 @@ def run_tests(
             for fut in futures:
                 test_flavor = futures[fut]
                 try:
-                    fut.result()
+                    result = fut.result()
                 except Exception as e:
-                    logger.error(str(e))
-                    failed_tests.append((test_flavor.test_name, str(e)))
+                    result = IntegrationTestReport(
+                        name=test_flavor.test_name,
+                        description=test_flavor.test_descr,
+                        failure_message=str(e),
+                    )
+                if result.failure_message is not None:
+                    logger.error(result.failure_message)
+                test_reports.append(result)
     else:
         for test_flavor in runnable:
-            try:
-                run_single_test(test_flavor, args.output_dir, module, config)
-            except Exception as e:
-                logger.error(str(e))
-                failed_tests.append((test_flavor.test_name, str(e)))
+            result = _run_test_for_report(test_flavor, args.output_dir, module, config)
+            if result.failure_message is not None:
+                logger.error(result.failure_message)
+            test_reports.append(result)
 
     ran_any_test = bool(runnable)
+    failed_tests = [
+        (report.name, report.failure_message)
+        for report in test_reports
+        if report.failure_message is not None
+    ]
+
+    if getattr(args, "junit_xml_dir", None):
+        _write_junit_xml_report(args.junit_xml_dir, args.test_suite, test_reports)
 
     if failed_tests:
         failure_summary = "\n".join(
@@ -352,6 +488,11 @@ def main():
         "At most --ngpu GPUs are in use at any time; each test is pinned to a "
         "disjoint subset via CUDA_/HIP_VISIBLE_DEVICES. "
         "Use --no-parallel to force sequential execution (default: parallel).",
+    )
+    parser.add_argument(
+        "--junit-xml-dir",
+        default=None,
+        help="Directory to write a JUnit XML report. No report is written by default.",
     )
     args = parser.parse_args()
 
