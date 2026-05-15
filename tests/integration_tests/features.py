@@ -9,17 +9,23 @@ import os
 
 from tests.integration_tests import OverrideDefinitions
 
-# Use RUNNER_TEMP if defined (GitHub Actions variable), else fallback to old path
-runner_temp = os.getenv("RUNNER_TEMP")
-if runner_temp:
-    checkpoint_path = os.path.join(
-        runner_temp,
-        "artifacts-to-be-uploaded/model_only_hf_checkpoint/hf_checkpoint/step-10/",
-    )
-else:
-    checkpoint_path = (
-        "artifacts-to-be-uploaded/model_only_hf_checkpoint/hf_checkpoint/step-10/"
-    )
+
+def _model_only_hf_checkpoint_path() -> str:
+    output_dir = os.getenv("TORCHTITAN_INTEGRATION_OUTPUT_DIR")
+    if output_dir is not None:
+        return os.path.join(
+            output_dir, "model_only_hf_checkpoint/hf_checkpoint/step-10/"
+        )
+
+    # Preserve the direct-import fallback for callers that build the feature
+    # list outside the integration test runner.
+    runner_temp = os.getenv("RUNNER_TEMP")
+    if runner_temp:
+        return os.path.join(
+            runner_temp,
+            "artifacts-to-be-uploaded/model_only_hf_checkpoint/hf_checkpoint/step-10/",
+        )
+    return "artifacts-to-be-uploaded/model_only_hf_checkpoint/hf_checkpoint/step-10/"
 
 
 def build_features_test_list() -> list[OverrideDefinitions]:
@@ -28,6 +34,8 @@ def build_features_test_list() -> list[OverrideDefinitions]:
     that is used to generate variations of integration tests based on the
     same root config file.
     """
+    checkpoint_path = _model_only_hf_checkpoint_path()
+
     integration_tests_flavors = [
         OverrideDefinitions(
             [

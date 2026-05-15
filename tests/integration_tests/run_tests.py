@@ -359,6 +359,7 @@ def main():
         os.makedirs(args.output_dir)
     if os.listdir(args.output_dir):
         raise RuntimeError("Please provide an empty output directory.")
+    os.environ["TORCHTITAN_INTEGRATION_OUTPUT_DIR"] = args.output_dir
 
     assert (
         args.test_suite in _TEST_SUITES_FUNCTION
