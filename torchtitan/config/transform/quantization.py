@@ -236,6 +236,8 @@ class MXFP8GroupedLinearConverter(QuantizationConverter):
         - mxfp8_rceil: MXFP8 dynamic quantization with RCEIL rounding mode
           when computing the e8m0 scale factors.
         """
+        use_flex_gemm: bool = False
+        """Use FlexGEMM QUACK for expert forward, input and weight gradients."""
         pad_multiple: int = 32
         """
         Pad per-expert token groups to this multiple for MXFP8 grouped GEMM alignment.
@@ -265,6 +267,7 @@ class MXFP8GroupedLinearConverter(QuantizationConverter):
             new_config = config_cls(
                 **{f.name: getattr(config, f.name) for f in fields(config)},
                 recipe_name=self.config.recipe_name,
+                use_flex_gemm=self.config.use_flex_gemm,
             )
             setattr(parent, attr, new_config)
 

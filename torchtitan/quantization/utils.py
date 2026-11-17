@@ -5,13 +5,14 @@
 # LICENSE file in the root directory of this source tree.
 
 import functools
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import cast, TypeVar
 
 from torchtitan.models.common.linear import GroupedLinear, Linear
 from torchtitan.models.common.moe.token_dispatcher import (
     AllToAllTokenDispatcher,
     HybridEPTokenDispatcher,
+    NCCLEPTokenDispatcher,
     TorchAOTokenDispatcher,
 )
 
@@ -64,6 +65,17 @@ def swap_token_dispatcher(routed_experts_config, pad_multiple: int) -> None:
             top_k=dispatcher.top_k,
             pad_multiple=pad_multiple,
         )
+    elif isinstance(dispatcher, NCCLEPTokenDispatcher.Config):
+        if pad_multiple != 32:
+            raise ValueError(
+                "NCCL EP quantized expert GEMMs are currently qualified only with "
+                "pad_multiple=32; NVFP4 expert GEMMs require pad_multiple=128 "
+                "and are not yet supported by this integration."
+            )
+        if dispatcher.pad_multiple != pad_multiple:
+            routed_experts_config.token_dispatcher = replace(
+                dispatcher, pad_multiple=pad_multiple
+            )
     elif isinstance(dispatcher, HybridEPTokenDispatcher.Config):
         routed_experts_config.token_dispatcher = HybridEPTokenDispatcher.Config(
             num_experts=dispatcher.num_experts,
@@ -76,7 +88,8 @@ def swap_token_dispatcher(routed_experts_config, pad_multiple: int) -> None:
     else:
         raise ValueError(
             f"MoE quantization requires a token dispatcher that supports "
-            f"padding (TorchAOTokenDispatcher or HybridEPTokenDispatcher), "
+            "padding (TorchAOTokenDispatcher, HybridEPTokenDispatcher, "
+            "or NCCLEPTokenDispatcher), "
             f"got {type(dispatcher).__name__}."
         )
 

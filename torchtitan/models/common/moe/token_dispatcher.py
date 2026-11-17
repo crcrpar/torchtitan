@@ -92,6 +92,9 @@ class LocalTokenDispatcher(Module):
     # True when combine expects routed outputs already weighted by
     # ``metadata.scores_R``: the experts then scale the W2 input instead.
     scores_on_expert_input = False
+    # True when routed rows (and the combine derivative) are torchao MXTensors,
+    # which only MXFP8 grouped experts consume.
+    mxfp8_rows = False
 
     @dataclass(kw_only=True, slots=True)
     class Config(Module.Config):
@@ -1155,8 +1158,13 @@ class NCCLEPTokenDispatcher(BaseEPTokenDispatcher):
     Router scores remain FP32. Expert GEMM precision is selected separately.
     """
 
+    _mxfp8_transport = False
     # nccl_ep.combine is a plain sum: the expert scales its W2 input.
     scores_on_expert_input = True
+
+    @property
+    def mxfp8_rows(self) -> bool:  # pyrefly: ignore[bad-override]
+        return self._mxfp8_transport
 
     @dataclass(kw_only=True, slots=True)
     class Config(BaseEPTokenDispatcher.Config):
@@ -1298,6 +1306,7 @@ class NCCLEPTokenDispatcher(BaseEPTokenDispatcher):
             ep_group.size(),
             self.num_experts // ep_group.size(),
             alignment=self.pad_multiple,
+            transport_mxfp8=self._mxfp8_transport,
             ht_flow=self.ht_flow,
         )
 
@@ -1305,3 +1314,31 @@ class NCCLEPTokenDispatcher(BaseEPTokenDispatcher):
         return self._nccl_ep.combine(
             routed_output_RD, metadata, self.num_max_tokens_per_rank
         )[: x_TD.shape[0]]
+
+
+class MXFP8NCCLEPTokenDispatcher(NCCLEPTokenDispatcher):
+    """NCCL EP MXFP8 transport with BF16 derivatives.
+
+    Received rows are torchao ``MXTensor``s (RCEIL, 1x32 scales) that MXFP8
+    grouped experts consume without requantizing. Their combine derivative is
+    MXFP8 rows too, so the W2 GEMM must be the last op before combine and the
+    scores scale its input.
+    """
+
+    _mxfp8_transport = True
+
+    @dataclass(kw_only=True, slots=True)
+    class Config(NCCLEPTokenDispatcher.Config):
+        pad_multiple: int = 32
+
+        def __post_init__(self) -> None:
+            NCCLEPTokenDispatcher.Config.__post_init__(self)
+            if self.ht_flow != "push_pull":
+                raise ValueError(
+                    "NCCL EP MXFP8 transport requires push_pull "
+                    "on the qualified native version."
+                )
+            if self.pad_multiple != 32:
+                raise ValueError("NCCL EP MXFP8 transport requires pad_multiple=32.")
+            if self.hidden_dim % 512:
+                raise ValueError("NCCL EP MXFP8 requires hidden_dim divisible by 512.")

@@ -4,7 +4,7 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
-"""Fixed-capacity NCCL EP BF16 transport with explicit derivatives."""
+"""Fixed-capacity NCCL EP BF16/MXFP8 transport with explicit derivatives."""
 
 import os
 import threading
@@ -16,13 +16,15 @@ from torch.distributed._functional_collectives import wait_tensor
 
 # TODO: These private TokenSwitch ops come from
 # https://github.com/pytorch/pytorch/pull/204973 (BF16) and
-# https://github.com/pytorch/pytorch/pull/204974 (the quantized dispatch, whose
-# side channel carries source-row identity bytes next to BF16 rows). Switch to
-# public APIs once torch.distributed._token_switch exposes them.
+# https://github.com/pytorch/pytorch/pull/204974 (MXFP8). Switch to public
+# APIs once torch.distributed._token_switch exposes them.
 from torch.distributed._token_switch import (
     _combine_async_op,
     _combine_backward_async_op,
+    _combine_backward_quantized_async_op,
+    _combine_quantized_async_op,
     _dispatch_backward_async_op,
+    _dispatch_backward_quantized_async_op,
     _dispatch_quantized_async_op,
     _NCCLEPObject,
     TokenSwitchNCCL,
@@ -30,7 +32,7 @@ from torch.distributed._token_switch import (
 
 from torchtitan.distributed.nccl_ep_capture import routing_capture_plan
 
-# Shape suffixes: T = source tokens, D = hidden features,
+# Shape suffixes: T = source tokens, D = hidden features, B = blocks of 32,
 # R = received expert rows, e = local experts, K = top-k experts,
 # U = aligned routing metadata bytes, P = source assignment positions,
 # X = arbitrary row payload features.
@@ -263,6 +265,45 @@ class DispatchMetadata:
     valid_R: torch.Tensor  # noqa: N815
     counts_e: torch.Tensor  # noqa: N815
     alignment: int
+    transport_mxfp8: bool = True
+
+
+def quantize_mxfp8(x_TD: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Encode BF16 rows as E4M3 bytes and row-major E8M0 RCEIL scales."""
+    if x_TD.ndim != 2 or x_TD.dtype != torch.bfloat16:
+        raise ValueError("MXFP8 transport requires a 2D BF16 input.")
+    if x_TD.shape[1] == 0 or x_TD.shape[1] % 512:
+        raise ValueError("MXFP8 transport hidden width must be divisible by 512.")
+    blocks_TBD = x_TD.float().unflatten(1, (-1, 32))
+    amax_TB = torch.where(torch.isnan(blocks_TBD), 0, blocks_TBD.abs()).amax(-1)
+    mantissa_TB, exponent_TB = torch.frexp(amax_TB)
+    # 448 = 0.875 * 2**9; frexp avoids underflow in amax / 448.
+    exponent_TB = exponent_TB - 9 + (mantissa_TB > 0.875).to(torch.int32)
+    exponent_TB = torch.where(torch.isinf(amax_TB), 127, exponent_TB)
+    exponent_TB = torch.where(amax_TB == 0, -127, exponent_TB).clamp(-127, 127)
+    scales_TB = (exponent_TB + 127).to(torch.uint8)
+    scaled_TBD = torch.ldexp(blocks_TBD, -exponent_TB[..., None])
+    payload_TD = scaled_TBD.clamp(-448, 448).to(torch.float8_e4m3fn).flatten(1)
+    return payload_TD.view(torch.uint8), scales_TB
+
+
+def dequantize_mxfp8(payload_TD: torch.Tensor, scales_TB: torch.Tensor) -> torch.Tensor:
+    """Decode the numeric scale prefix; opaque suffix bytes are not interpreted."""
+    if payload_TD.ndim != 2 or payload_TD.dtype != torch.uint8:
+        raise ValueError("MXFP8 payload must be a 2D uint8 tensor.")
+    num_blocks = payload_TD.shape[1] // 32
+    if payload_TD.shape[1] == 0 or payload_TD.shape[1] % 32:
+        raise ValueError("MXFP8 payload width must be divisible by 32.")
+    if (
+        scales_TB.ndim != 2
+        or scales_TB.dtype != torch.uint8
+        or scales_TB.shape[0] != payload_TD.shape[0]
+        or scales_TB.shape[1] < num_blocks
+    ):
+        raise ValueError("MXFP8 scales must provide one uint8 per 32 payload values.")
+    values_TBD = payload_TD.view(torch.float8_e4m3fn).float().unflatten(1, (-1, 32))
+    scale_TB = scales_TB[:, :num_blocks].contiguous().view(torch.float8_e8m0fnu).float()
+    return (values_TBD * scale_TB[..., None]).flatten(1).to(torch.bfloat16)
 
 
 def source_identity_bytes(
@@ -286,7 +327,7 @@ def source_rows(metadata_RU):
 
 
 def canonical_expert_order(
-    identity_RU: torch.Tensor,
+    scales_RD: torch.Tensor,
     counts_e: torch.Tensor,
     max_source_tokens: int,
     *,
@@ -297,9 +338,9 @@ def canonical_expert_order(
     Returns ``(order_R, inverse_R, valid_R)``; the permutation is ``None`` when
     native rows are already in canonical order.
     """
-    source_R = source_rows(identity_RU)
+    source_R = source_rows(scales_RD)
     valid_R = source_R != 0
-    rows_R = torch.arange(identity_RU.shape[0], device=identity_RU.device)
+    rows_R = torch.arange(scales_RD.shape[0], device=scales_RD.device)
     expert_R = torch.bucketize(rows_R, counts_e.cumsum(0), right=True)
     keys_R = expert_R * (max_source_tokens + 2) + torch.where(
         valid_R, source_R, max_source_tokens + 1
@@ -327,6 +368,12 @@ class _CanonicalRowPermutation(torch.autograd.Function):
     @staticmethod
     def forward(ctx, values_RX, order_R, inverse_R):  # pyrefly: ignore[bad-override]
         ctx.save_for_backward(inverse_R)
+        from torchao.prototype.mx_formats.mx_tensor import MXTensor
+
+        if isinstance(values_RX, MXTensor):
+            return MXTensor.from_qdata_and_scales(
+                values_RX.qdata[order_R], values_RX.scale[order_R], values_RX.dtype
+            )
         return values_RX[order_R]
 
     @staticmethod
@@ -354,32 +401,52 @@ class _Dispatch(torch.autograd.Function):
         ep_rank,
         max_source_tokens,
         num_local_experts,
+        transport_mxfp8=True,
     ):
         native, counts_e = _prepare_scanned_routing(ids_TK, pool, num_local_experts)
         identity_TU = source_identity_bytes(x_TD, ep_rank, max_source_tokens)
-        # The quantized dispatch forwards BF16 rows unchanged alongside opaque
-        # side-channel bytes, here each row's source identity.
-        received_RD, scores_R, _, identity_RU = _dispatch_quantized_async_op(
+        if transport_mxfp8:
+            payload_TD, scales_TB = quantize_mxfp8(x_TD)
+            payload_TD = payload_TD.view(torch.float8_e4m3fn)
+            scales_TB = torch.cat((scales_TB, identity_TU), 1)
+        else:
+            # QUANT_FWD forwards BF16 unchanged alongside opaque identity bytes.
+            payload_TD, scales_TB = x_TD, identity_TU
+        received_RD, scores_R, _, received_scales_RB = _dispatch_quantized_async_op(
             native,
-            x_TD,
-            identity_TU,
+            payload_TD,
+            scales_TB,
             scores_TK.contiguous(),
             capacity,
             "expert_major",
             initialize_tokens=False,
         )
         counts_e = wait_tensor(counts_e)
-        identity_RU = wait_tensor(identity_RU)
+        received_scales_RB = wait_tensor(received_scales_RB)
         received_RD = wait_tensor(received_RD)
+        if transport_mxfp8:
+            from torchao.prototype.mx_formats.mx_tensor import MXTensor
+
+            # The transport uses the RCEIL 1x32 encoding of torchao's MXFP8
+            # grouped GEMM, so the received rows feed it without requantizing.
+            num_blocks = received_RD.shape[1] // 32
+            received_RD = MXTensor.from_qdata_and_scales(
+                received_RD,
+                received_scales_RB[:, :num_blocks]
+                .contiguous()
+                .view(torch.float8_e8m0fnu),
+                torch.bfloat16,
+            )
+        ctx.transport_mxfp8 = transport_mxfp8
         ctx.native = native
         ctx.num_tokens, ctx.top_k = scores_TK.shape
-        ctx.mark_non_differentiable(counts_e, identity_RU)
+        ctx.mark_non_differentiable(counts_e, received_scales_RB)
         return (
             received_RD,
             wait_tensor(scores_R),
             counts_e,
             native,
-            identity_RU,
+            received_scales_RB,
         )
 
     @staticmethod
@@ -389,9 +456,14 @@ class _Dispatch(torch.autograd.Function):
         grad_scores_R,
         grad_counts,
         grad_native,
-        grad_identity,
+        grad_scales,
     ):
-        tokens_TD, scores_TK = _combine_backward_async_op(
+        backward_op = (
+            _combine_backward_quantized_async_op
+            if ctx.transport_mxfp8
+            else _combine_backward_async_op
+        )
+        tokens_TD, scores_TK = backward_op(
             ctx.native,
             grad_tokens_RD.contiguous(),
             grad_scores_R.contiguous(),
@@ -399,13 +471,15 @@ class _Dispatch(torch.autograd.Function):
             ctx.top_k,
         )
         tokens_TD, scores_TK = wait_tensor(tokens_TD), wait_tensor(scores_TK)
-        return tokens_TD, scores_TK, None, None, None, None, None, None
+        return tokens_TD, scores_TK, None, None, None, None, None, None, None
 
 
 def _zero_bucket_padding_(rows_RD, valid_R, counts_e, alignment, order_R=None):
     """Zero the uninitialized alignment rows inside each GEMM group.
 
-    Canonical order puts the at most ``alignment - 1`` padding rows
+    ``rows_RD`` is a plain tensor or an ``MXTensor`` (its payload is zeroed;
+    the received scales are zero-initialized, and E8M0 0 is 2**-127, a finite
+    scale). Canonical order puts the at most ``alignment - 1`` padding rows
     last in each bucket, so only those last rows of each bucket are visited.
     Visited real rows are written back unchanged, so duplicate indices all
     write the same value. With ``order_R``, ``rows_RD`` is in native order and
@@ -419,7 +493,10 @@ def _zero_bucket_padding_(rows_RD, valid_R, counts_e, alignment, order_R=None):
     keep_N1 = valid_R[rows_N, None]
     if order_R is not None:
         rows_N = order_R[rows_N]
-    rows_RD[rows_N] = torch.where(keep_N1, rows_RD[rows_N], 0)
+    payload_RD = (
+        rows_RD.qdata.view(torch.uint8) if hasattr(rows_RD, "qdata") else rows_RD
+    )
+    payload_RD[rows_N] = torch.where(keep_N1, payload_RD[rows_N], 0)
 
 
 def dispatch(
@@ -434,8 +511,18 @@ def dispatch(
     num_local_experts,
     *,
     alignment,
+    transport_mxfp8=True,
     ht_flow="push_pull",
 ):
+    if transport_mxfp8 and torch.compiler.is_dynamo_compiling():
+        # TODO: Dynamo speculates an autograd.Function backward with its
+        # forward outputs as gradient placeholders, so the MXTensor rows get an
+        # MXTensor gradient instead of a BF16 one. make_fx tracing
+        # (graph_trainer) and eager are unaffected.
+        raise RuntimeError(
+            "NCCL EP MXFP8 transport cannot be traced by torch.compile; "
+            "use graph_trainer or eager."
+        )
     sorted_ids_TK = ids_TK.sort(-1).values
     torch._assert_async(
         (
@@ -443,7 +530,7 @@ def dispatch(
         ).all(),
         "NCCL EP requires unique top-k experts per source token.",
     )
-    (received_RD, scores_R, counts_e, native, identity_RU,) = _Dispatch.apply(
+    (received_RD, scores_R, counts_e, native, scales_RB,) = _Dispatch.apply(
         x_TD,
         scores_TK,
         ids_TK,
@@ -452,21 +539,32 @@ def dispatch(
         ep_rank,
         max_source_tokens,
         num_local_experts,
+        transport_mxfp8,
     )
     order_R, inverse_R, valid_R = canonical_expert_order(
-        identity_RU,
+        scales_RB,
         counts_e,
         max_source_tokens * ep_size,
         # Native returns source-ordered rows only on the AllGather + scan
-        # metadata path with pull_push; the default count exchange does not.
+        # metadata path; the default count exchange does not.
         native_source_order=(
-            os.environ.get("NCCL_EP_HT_AG_SCAN_MODE") == "1" and ht_flow == "pull_push"
+            os.environ.get("NCCL_EP_HT_AG_SCAN_MODE") == "1"
+            and (
+                ht_flow == "pull_push"
+                or (
+                    transport_mxfp8
+                    and os.environ.get("NCCL_EP_HT_RECV_TOPK_ORDER") == "expert-ascend"
+                )
+            )
         ),
     )
     if order_R is not None:
         received_RD = _CanonicalRowPermutation.apply(received_RD, order_R, inverse_R)
         scores_R = _CanonicalRowPermutation.apply(scores_R, order_R, inverse_R)
-    received_RD = torch.where(valid_R[:, None], received_RD, 0)
+    if transport_mxfp8:
+        _zero_bucket_padding_(received_RD, valid_R, counts_e, alignment)
+    else:
+        received_RD = torch.where(valid_R[:, None], received_RD, 0)
     scores_R = torch.where(valid_R, scores_R, 0)
     metadata = DispatchMetadata(
         native=native,
@@ -476,6 +574,7 @@ def dispatch(
         valid_R=valid_R,
         counts_e=counts_e,
         alignment=alignment,
+        transport_mxfp8=transport_mxfp8,
     )
     return received_RD, counts_e, metadata
 
@@ -487,37 +586,69 @@ class _Combine(torch.autograd.Function):
         x_RD,
         native,
         num_tokens,
+        transport_mxfp8,
         valid_R,
         counts_e,
         alignment,
         order_R,
     ):
         ctx.native = native
-        ctx.alignment = alignment
-        ctx.save_for_backward(valid_R, counts_e, order_R)
+        ctx.canonical = order_R is None
+        if not transport_mxfp8:
+            ctx.alignment = alignment
+            ctx.save_for_backward(valid_R, counts_e, order_R)
         ctx.capacity = x_RD.shape[0]
-        output_TD = _combine_async_op(
-            native, x_RD.contiguous(), num_tokens, ctx.capacity
-        )
+        ctx.transport_mxfp8 = transport_mxfp8
+        if transport_mxfp8:
+            output_TD = _combine_quantized_async_op(
+                native, x_RD.contiguous(), num_tokens
+            )
+        else:
+            output_TD = _combine_async_op(
+                native, x_RD.contiguous(), num_tokens, ctx.capacity
+            )
         return wait_tensor(output_TD)
 
     @staticmethod
     def backward(ctx, grad_tokens_TD):  # pyrefly: ignore[bad-override]
-        # Each expert contribution receives the same source-token derivative.
-        output_RD = wait_tensor(
-            _dispatch_backward_async_op(
-                ctx.native,
-                grad_tokens_TD.contiguous(),
-                ctx.capacity,
-                initialize_tokens=False,
+        if not ctx.transport_mxfp8:
+            # Each expert contribution receives the same source-token derivative.
+            output_RD = wait_tensor(
+                _dispatch_backward_async_op(
+                    ctx.native,
+                    grad_tokens_TD.contiguous(),
+                    ctx.capacity,
+                    initialize_tokens=False,
+                )
             )
+            # The derivative feeds W2's backward directly, whose weight
+            # gradient reads every row of each group, so padding rows must
+            # not hold uninitialized (possibly NaN) values.
+            valid_R, counts_e, order_R = ctx.saved_tensors
+            _zero_bucket_padding_(output_RD, valid_R, counts_e, ctx.alignment, order_R)
+            return output_RD, None, None, None, None, None, None, None
+        payload_TD, scales_TB = quantize_mxfp8(grad_tokens_TD.contiguous())
+        tokens_RD, scales_RB = _dispatch_backward_quantized_async_op(
+            ctx.native, payload_TD.view(torch.float8_e4m3fn), scales_TB, ctx.capacity
         )
-        # The derivative feeds W2's backward directly, whose weight
-        # gradient reads every row of each group, so padding rows must
-        # not hold uninitialized (possibly NaN) values.
-        valid_R, counts_e, order_R = ctx.saved_tensors
-        _zero_bucket_padding_(output_RD, valid_R, counts_e, ctx.alignment, order_R)
-        return output_RD, None, None, None, None, None, None
+        tokens_RD, scales_RB = wait_tensor(tokens_RD), wait_tensor(scales_RB)
+        if not ctx.canonical:
+            # The row permutation's derivative needs plain rows.
+            grad_RD = dequantize_mxfp8(tokens_RD.view(torch.uint8), scales_RB)
+        else:
+            from torchao.prototype.mx_formats.mx_tensor import MXTensor
+
+            # Outputs are zero-initialized and only mapped rows are written,
+            # so padding and unused rows are zero. The expert GEMM's dgrad
+            # consumes the received 1x32 rows as-is.
+            grad_RD = MXTensor.from_qdata_and_scales(
+                tokens_RD,
+                scales_RB[:, : tokens_RD.shape[1] // 32]
+                .contiguous()
+                .view(torch.float8_e8m0fnu),
+                torch.bfloat16,
+            )
+        return grad_RD, None, None, None, None, None, None, None
 
 
 def combine(routed_output_RD, metadata, num_tokens):
@@ -535,6 +666,7 @@ def combine(routed_output_RD, metadata, num_tokens):
         routed_output_RD,
         metadata.native,
         num_tokens,
+        metadata.transport_mxfp8,
         metadata.valid_R,
         metadata.counts_e,
         metadata.alignment,

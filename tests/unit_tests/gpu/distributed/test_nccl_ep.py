@@ -15,8 +15,13 @@ import torch.multiprocessing as mp
 from torch.distributed.device_mesh import init_device_mesh
 
 
-def _worker(rank, world_size, store_path, top_k):
+def _worker(rank, world_size, store_path, transport_mxfp8, top_k):
     os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
+    if transport_mxfp8 and top_k == 6:
+        # Native source order: canonical rows, so combine's derivative stays
+        # MXFP8. top_k=2 keeps the permuted path.
+        os.environ["NCCL_EP_HT_AG_SCAN_MODE"] = "1"
+        os.environ["NCCL_EP_HT_RECV_TOPK_ORDER"] = "expert-ascend"
     torch.cuda.set_device(rank)
     torch.use_deterministic_algorithms(True)
     dist.init_process_group(
@@ -28,7 +33,10 @@ def _worker(rank, world_size, store_path, top_k):
         accelerator_graph_teardown,
         AcceleratorGraphWrapper,
     )
-    from torchtitan.models.common.moe.token_dispatcher import NCCLEPTokenDispatcher
+    from torchtitan.models.common.moe.token_dispatcher import (
+        MXFP8NCCLEPTokenDispatcher,
+        NCCLEPTokenDispatcher,
+    )
 
     mesh = init_device_mesh("cuda", (world_size,), mesh_dim_names=("ep",))
     from torchtitan.distributed.nccl_ep_capture import (
@@ -44,17 +52,21 @@ def _worker(rank, world_size, store_path, top_k):
 
     with set_current_spmd_mesh(mesh):
         try:
+            dispatcher_type = (
+                MXFP8NCCLEPTokenDispatcher if transport_mxfp8 else NCCLEPTokenDispatcher
+            )
             num_experts = 64 if top_k == 6 else world_size * 2
             num_local_experts = num_experts // world_size
-            dispatcher = NCCLEPTokenDispatcher.Config(
+            dispatcher = dispatcher_type.Config(
                 num_experts=num_experts,
                 top_k=top_k,
                 hidden_dim=512,
                 num_max_tokens_per_rank=32,
-                # Pad only for top_k=6, whose combine derivative then has
+                # MXFP8 transport always pads expert groups to 32 rows. BF16
+                # pads only for top_k=6, whose combine derivative then has
                 # padding rows inside each group.
-                pad_multiple=1 if top_k == 2 else 32,
-                ht_flow="pull_push",
+                pad_multiple=1 if top_k == 2 and not transport_mxfp8 else 32,
+                ht_flow="push_pull" if transport_mxfp8 else "pull_push",
             ).build()
             with owner.initialize():
                 dispatcher.init_buffer()
@@ -79,16 +91,61 @@ def _worker(rank, world_size, store_path, top_k):
                 rank * num_local_experts + torch.arange(top_k, device="cuda")
             ).repeat(32, 1)
             routing_map = torch.empty(0, device="cuda", dtype=torch.bool)
+            # (e, K, N) weights in the per-group column-major layout torchao expects.
+            weights = [
+                (
+                    torch.randn(
+                        num_local_experts,
+                        512,
+                        512,
+                        device="cuda",
+                        generator=torch.Generator("cuda").manual_seed(0),
+                    )
+                    .div(16)
+                    .bfloat16()
+                    .transpose(-2, -1)
+                )
+            ]
 
             def forward(x, scores, ids):
                 assert dispatcher is not None
-                routed, _, metadata = dispatcher.dispatch(x, scores, ids, routing_map)
-                # Like the MoE experts, scores scale the rows before combine.
-                scored = (routed.square() * metadata.scores_R[:, None]).to(routed.dtype)
-                return dispatcher.combine(scored, metadata, x)
+                routed, counts, metadata = dispatcher.dispatch(
+                    x, scores, ids, routing_map
+                )
+                if not transport_mxfp8:
+                    # Like the MoE experts, scores scale the rows before combine.
+                    scored = (routed.square() * metadata.scores_R[:, None]).to(
+                        routed.dtype
+                    )
+                    return dispatcher.combine(scored, metadata, x)
+                from torchao.prototype.moe_training.mxfp8_grouped_mm import (
+                    _to_mxfp8_then_scaled_grouped_mm,
+                )
+                from torchao.quantization.quantize_.common import KernelPreference
 
-            compiled = torch.compile(
-                forward, fullgraph=True, options={"emulate_precision_casts": True}
+                # The SM100 kernels need 128-row buffers; this one is smaller.
+                emulated = KernelPreference.EMULATED
+
+                # Like the MoE experts: MXFP8 rows feed a grouped GEMM, scores
+                # scale the second GEMM's input, and its output goes straight
+                # to combine, whose derivative is MXFP8 rows.
+                offsets_e = counts.cumsum(0, dtype=torch.int32)
+                hidden = _to_mxfp8_then_scaled_grouped_mm(
+                    routed, weights[0], offs=offsets_e, kernel_preference=emulated
+                ).square()
+                hidden = (hidden * metadata.scores_R[:, None]).to(hidden.dtype)
+                routed = _to_mxfp8_then_scaled_grouped_mm(
+                    hidden, weights[0], offs=offsets_e, kernel_preference=emulated
+                )
+                return dispatcher.combine(routed, metadata, x)
+
+            # torch.compile cannot trace the MXFP8 transport's MXTensor rows.
+            compiled = (
+                forward
+                if transport_mxfp8
+                else torch.compile(
+                    forward, fullgraph=True, options={"emulate_precision_casts": True}
+                )
             )
             x.grad = torch.zeros_like(x)
             scores.grad = torch.zeros_like(scores)
@@ -124,8 +181,23 @@ def _worker(rank, world_size, store_path, top_k):
                 actual = tuple(value.clone() for value in graph(x, scores, ids))
                 reference_x = x.detach().clone().requires_grad_()
                 reference_scores = scores.detach().clone().requires_grad_()
+                if transport_mxfp8:
+                    # 0xFF is NaN in E4M3 and E8M0: uninitialized transport rows
+                    # (padding, unused capacity) now hold NaN, which reaches the
+                    # weight gradient if any of them leaks into a GEMM.
+                    poison = [
+                        torch.full((size,), 255, dtype=torch.uint8, device="cuda")
+                        for size in [1 << 20] * 64 + [64 << 20] * 4
+                    ]
+                    del poison
+                    weights[0] = weights[0].detach().requires_grad_()
                 expected = forward(reference_x, reference_scores, ids)
                 expected.float().sum().backward()
+                if transport_mxfp8:
+                    weight_grad = weights[0].grad
+                    assert weight_grad is not None
+                    assert torch.isfinite(weight_grad).all()
+                    weights[0] = weights[0].detach()
                 for value, reference in zip(
                     actual,
                     (expected, reference_x.grad, reference_scores.grad),
@@ -140,44 +212,47 @@ def _worker(rank, world_size, store_path, top_k):
                         value.contiguous().view(integer_dtype),
                         reference.contiguous().view(integer_dtype),
                     )
-                oracle_x = x.detach().clone().requires_grad_()
-                oracle_scores = scores.detach().clone().requires_grad_()
-                from torchtitan.ops.scatter_add import deterministic_scatter_add
+                if not transport_mxfp8:
+                    oracle_x = x.detach().clone().requires_grad_()
+                    oracle_scores = scores.detach().clone().requires_grad_()
+                    from torchtitan.ops.scatter_add import deterministic_scatter_add
 
-                expert_order_TK = ids.flatten().argsort(stable=True)
-                source_R = expert_order_TK // top_k
-                # Native combine and its adjoint sum each token's rows in
-                # FP32 and round to BF16 once.
-                expert_x_RD = oracle_x.float()[source_R].to(torch.bfloat16)
-                expert_scores_R = oracle_scores.flatten()[expert_order_TK]
-                contributions_RD = (expert_x_RD.square() * expert_scores_R[:, None]).to(
-                    torch.bfloat16
-                )
-                contributions_RD = torch.where(
-                    (ids.flatten()[expert_order_TK] >= 0)[:, None],
-                    contributions_RD,
-                    0,
-                )
-                oracle_output = deterministic_scatter_add(
-                    torch.zeros_like(oracle_x, dtype=torch.float32),
-                    source_R[:, None].expand(-1, 512),
-                    contributions_RD.float(),
-                ).to(torch.bfloat16)
-                oracle_output.float().sum().backward()
-                for value, reference in zip(
-                    actual,
-                    (oracle_output, oracle_x.grad, oracle_scores.grad),
-                    strict=True,
-                ):
-                    assert reference is not None
-                    torch.testing.assert_close(value, reference, rtol=0, atol=0)
-                    integer_dtype = (
-                        torch.int16 if value.dtype == torch.bfloat16 else torch.int32
+                    expert_order_TK = ids.flatten().argsort(stable=True)
+                    source_R = expert_order_TK // top_k
+                    # Native combine and its adjoint sum each token's rows in
+                    # FP32 and round to BF16 once.
+                    expert_x_RD = oracle_x.float()[source_R].to(torch.bfloat16)
+                    expert_scores_R = oracle_scores.flatten()[expert_order_TK]
+                    contributions_RD = (
+                        expert_x_RD.square() * expert_scores_R[:, None]
+                    ).to(torch.bfloat16)
+                    contributions_RD = torch.where(
+                        (ids.flatten()[expert_order_TK] >= 0)[:, None],
+                        contributions_RD,
+                        0,
                     )
-                    assert torch.equal(
-                        value.contiguous().view(integer_dtype),
-                        reference.contiguous().view(integer_dtype),
-                    )
+                    oracle_output = deterministic_scatter_add(
+                        torch.zeros_like(oracle_x, dtype=torch.float32),
+                        source_R[:, None].expand(-1, 512),
+                        contributions_RD.float(),
+                    ).to(torch.bfloat16)
+                    oracle_output.float().sum().backward()
+                    for value, reference in zip(
+                        actual,
+                        (oracle_output, oracle_x.grad, oracle_scores.grad),
+                        strict=True,
+                    ):
+                        assert reference is not None
+                        torch.testing.assert_close(value, reference, rtol=0, atol=0)
+                        integer_dtype = (
+                            torch.int16
+                            if value.dtype == torch.bfloat16
+                            else torch.int32
+                        )
+                        assert torch.equal(
+                            value.contiguous().view(integer_dtype),
+                            reference.contiguous().view(integer_dtype),
+                        )
             graph.teardown()
             plan.release()
             graph = None
@@ -201,10 +276,13 @@ def _worker(rank, world_size, store_path, top_k):
     reason="requires TokenSwitch NCCL EP (CUDA only)",
 )
 @pytest.mark.parametrize("top_k", [2, 6])
-def test_dispatcher_fullgraph_and_changing_route_training(tmp_path, top_k):
+@pytest.mark.parametrize("transport_mxfp8", [False, True])
+def test_dispatcher_fullgraph_and_changing_route_training(
+    tmp_path, transport_mxfp8, top_k
+):
     mp.spawn(
         _worker,
-        args=(4, str(tmp_path / "nccl-ep-store"), top_k),
+        args=(4, str(tmp_path / "nccl-ep-store"), transport_mxfp8, top_k),
         nprocs=4,
         join=True,
     )

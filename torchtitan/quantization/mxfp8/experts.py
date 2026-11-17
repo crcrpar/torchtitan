@@ -6,7 +6,7 @@
 
 """MXFP8 grouped-linear building blocks."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 _mxfp8_grouped_linear_cache: dict[type, type] = {}
 
@@ -29,6 +29,7 @@ def _get_mxfp8_grouped_linear_cls(parent_cls: type) -> type:
         @dataclass(kw_only=True, slots=True)
         class Config(parent_config_cls):  # type: ignore[misc]
             recipe_name: str = "mxfp8_rceil"
+            use_flex_gemm: bool = False
 
         def __init__(self, config: Config):
             super().__init__(config)
@@ -39,6 +40,10 @@ def _get_mxfp8_grouped_linear_cls(parent_cls: type) -> type:
 
             recipe = MXFP8TrainingRecipe(config.recipe_name)
             self._mxfp8_op_config = MXFP8TrainingOpConfig.from_recipe(recipe)
+            if config.use_flex_gemm:
+                self._mxfp8_op_config = replace(
+                    self._mxfp8_op_config, use_flex_gemm=True
+                )
 
         def _grouped_mm(self, *, input_RI, weight_EOI, offsets_E):
             from torchao.prototype.moe_training.utils import (
@@ -56,3 +61,8 @@ def _get_mxfp8_grouped_linear_cls(parent_cls: type) -> type:
     MXFP8GroupedLinear.__qualname__ = f"MXFP8{parent_cls.__name__}"
     _mxfp8_grouped_linear_cache[parent_cls] = MXFP8GroupedLinear
     return MXFP8GroupedLinear
+
+
+def is_mxfp8_grouped_linear(module: object) -> bool:
+    """Return whether ``module`` is an MXFP8 grouped linear from this module."""
+    return type(module) in _mxfp8_grouped_linear_cache.values()

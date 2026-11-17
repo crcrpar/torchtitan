@@ -116,6 +116,22 @@ class RoutedExperts(Module):
             else None
         )
         self.token_dispatcher = config.token_dispatcher.build()
+        # Converters replace the expert configs after __post_init__, so the
+        # MXFP8 row contract is checked on the built modules.
+        if self.token_dispatcher.mxfp8_rows:
+            from torchtitan.quantization.mxfp8.experts import is_mxfp8_grouped_linear
+
+            if not (
+                is_mxfp8_grouped_linear(self.w13) and is_mxfp8_grouped_linear(self.w2)
+            ):
+                raise ValueError(
+                    "MXFP8 token dispatch requires MXFP8 grouped w13 and w2."
+                )
+            if self.output_postprocess is not None:
+                raise ValueError(
+                    "MXFP8 token dispatch requires W2 to feed combine directly; "
+                    "output_postprocess is unsupported."
+                )
 
     def _init_self_buffers(self, *, buffer_device: torch.device | None = None) -> None:
         del buffer_device

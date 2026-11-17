@@ -289,21 +289,28 @@ def test_trainer_keeps_scheduled_eval_during_warmup(
     assert engine.num_completed_steps == loaded_step + training_steps
 
 
-def test_nccl_ep_graph_config_and_single_rank_rejection(monkeypatch):
+@pytest.mark.parametrize("transport_mxfp8", [False, True])
+def test_nccl_ep_graph_config_and_single_rank_rejection(monkeypatch, transport_mxfp8):
     from torchtitan.config.parallelism import ParallelismConfig
     from torchtitan.config.transform import TokenDispatcherTransform
     from torchtitan.config.validation import validate_model_training_config
     from torchtitan.models.base import BaseModel
-    from torchtitan.models.common.moe.token_dispatcher import NCCLEPTokenDispatcher
+    from torchtitan.models.common.moe.token_dispatcher import (
+        MXFP8NCCLEPTokenDispatcher,
+        NCCLEPTokenDispatcher,
+    )
     from torchtitan_recipes.tests.models.deepseek_v3 import deepseek_v3_16b
 
     config = deepseek_v3_16b(
         seq_len=128, parallelism=ParallelismConfig(expert_parallel_degree=4)
     )
+    dispatcher_type = (
+        MXFP8NCCLEPTokenDispatcher if transport_mxfp8 else NCCLEPTokenDispatcher
+    )
     config.model = cast(
         BaseModel.Config,
         TokenDispatcherTransform(
-            dispatcher=NCCLEPTokenDispatcher, num_max_tokens_per_rank=128
+            dispatcher=dispatcher_type, num_max_tokens_per_rank=128
         ).transform(config.model),
     )
     config.training.disable_accelerator_graphs = False

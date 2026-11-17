@@ -19,6 +19,7 @@ from torchtitan.distributed.nccl_ep_capture import (  # noqa: E402
     NCCLEPRoutingCapturePlan,
 )
 from torchtitan.models.common.moe.token_dispatcher import (  # noqa: E402
+    MXFP8NCCLEPTokenDispatcher,
     NCCLEPTokenDispatcher,
 )
 
@@ -112,7 +113,11 @@ def test_shared_buffer_closes_after_final_user():
         assert not nccl_ep._buffers
 
 
-def test_canonical_order_sorts_sources_and_marks_padding():
+def test_transport_power_of_two_roundtrip_and_canonical_padding():
+    values = torch.tensor([0, 1, -2, 0.25], dtype=torch.bfloat16).repeat(3, 128)
+    payload, scales = nccl_ep.quantize_mxfp8(values)
+    actual = nccl_ep.dequantize_mxfp8(payload, scales)
+    torch.testing.assert_close(actual, values, rtol=0, atol=0)
     source = torch.zeros(6, 32, dtype=torch.uint8)
     source[[0, 1, 3, 4], -16] = torch.tensor([4, 1, 3, 2], dtype=torch.uint8)
     order, inverse, valid = nccl_ep.canonical_expert_order(
@@ -124,19 +129,64 @@ def test_canonical_order_sorts_sources_and_marks_padding():
     assert valid.tolist() == [True, True, False, True, True, False]
 
 
-@pytest.mark.parametrize("kwargs", ({"num_max_tokens_per_rank": 0}, {"top_k": 5}))
+@pytest.mark.parametrize(
+    "kwargs", ({"hidden_dim": 256}, {"num_max_tokens_per_rank": 0}, {"top_k": 5})
+)
 def test_invalid_dispatcher_config(kwargs):
     values = dict(num_experts=4, top_k=2, hidden_dim=512, num_max_tokens_per_rank=16)
     values.update(kwargs)
     with pytest.raises(ValueError):
-        NCCLEPTokenDispatcher.Config(**values)
+        MXFP8NCCLEPTokenDispatcher.Config(**values)
 
 
-def test_dispatch_returns_waited_identity_and_counts(monkeypatch):
-    tokens = torch.zeros(2, 256, dtype=torch.bfloat16)
+@pytest.mark.parametrize(
+    "dispatcher_type", [NCCLEPTokenDispatcher, MXFP8NCCLEPTokenDispatcher]
+)
+@pytest.mark.parametrize("enabled", [False, True])
+def test_expert_converter_selects_flex_and_preserves_native_padding(
+    enabled, dispatcher_type, monkeypatch
+):
+    from torchtitan.config.transform import MXFP8GroupedLinearConverter
+    from torchtitan.models.common.linear import GroupedLinear
+    from torchtitan.models.common.moe import RoutedExperts
+
+    monkeypatch.setattr(
+        "torchtitan.config.transform.quantization.has_cuda_capability",
+        lambda *args: True,
+    )
+    native = dispatcher_type.Config(
+        num_experts=4, top_k=2, hidden_dim=512, num_max_tokens_per_rank=16
+    )
+    experts = RoutedExperts.Config(
+        w13=GroupedLinear.Config(
+            group_size=4, in_features=512, out_features=512, num_linears=2
+        ),
+        w2=GroupedLinear.Config(
+            group_size=4, in_features=512, out_features=512, num_linears=1
+        ),
+        token_dispatcher=native,
+    )
+    MXFP8GroupedLinearConverter.Config(use_flex_gemm=enabled).build().convert(experts)
+    assert type(experts.token_dispatcher) is type(native)
+    assert experts.token_dispatcher.pad_multiple == 32
+    assert experts.token_dispatcher.hidden_dim == native.hidden_dim
+    assert (
+        experts.token_dispatcher.num_max_tokens_per_rank
+        == native.num_max_tokens_per_rank
+    )
+    if dispatcher_type is MXFP8NCCLEPTokenDispatcher:
+        assert experts.token_dispatcher is native
+    else:
+        assert native.pad_multiple == 1
+    for projection in (experts.w13, experts.w2):
+        assert projection.build()._mxfp8_op_config.use_flex_gemm is enabled
+
+
+def test_dispatch_metadata_returns_waited_scales(monkeypatch):
+    tokens = torch.zeros(2, 512, dtype=torch.bfloat16)
     scores = torch.ones(2, 1)
-    raw_identity = torch.zeros(2, 16, dtype=torch.uint8)
-    waited_identity = torch.full_like(raw_identity, 1)
+    raw_scales = torch.zeros(2, 32, dtype=torch.uint8)
+    waited_scales = torch.full_like(raw_scales, 127)
     waited_counts = torch.tensor([2], dtype=torch.int32)
     counts = torch.tensor([2], dtype=torch.int32)
     native = object()
@@ -145,15 +195,25 @@ def test_dispatch_returns_waited_identity_and_counts(monkeypatch):
     )
     monkeypatch.setattr(
         nccl_ep,
+        "quantize_mxfp8",
+        lambda x: (torch.zeros_like(x, dtype=torch.uint8), raw_scales[:, :16]),
+    )
+    monkeypatch.setattr(
+        nccl_ep,
         "_dispatch_quantized_async_op",
-        lambda *args, **kwargs: (tokens, scores[:, 0], None, raw_identity),
+        lambda *args, **kwargs: (
+            tokens.to(torch.float8_e4m3fn),
+            scores,
+            None,
+            raw_scales,
+        ),
     )
     monkeypatch.setattr(
         nccl_ep,
         "wait_tensor",
         lambda value: (
-            waited_identity
-            if value is raw_identity
+            waited_scales
+            if value is raw_scales
             else (waited_counts if value is counts else value)
         ),
     )
@@ -161,8 +221,69 @@ def test_dispatch_returns_waited_identity_and_counts(monkeypatch):
     outputs = nccl_ep._Dispatch.forward(
         ctx, tokens, scores, torch.zeros(2, 1, dtype=torch.int64), None, 2, 0, 2, 1
     )
-    assert outputs[4] is waited_identity
+    # The MXTensor rows carry the waited E8M0 prefix, not the raw buffer.
+    assert torch.equal(outputs[0].scale.view(torch.uint8), waited_scales[:, :16])
+    assert outputs[4] is waited_scales
+
     assert outputs[2] is waited_counts
+
+
+def test_mxfp8_dispatch_zeroes_group_padding(monkeypatch):
+    # The received MXFP8 rows feed the expert grouped GEMMs, whose weight
+    # gradients read every row of each group. Native leaves padding rows
+    # uninitialized (E4M3 NaN here); they must reach the experts as zero.
+    # Alignment 4: group rows 0-3 (2, 3 padding) and 4-7 (7 padding); rows 8-9
+    # are unused capacity, which the grouped GEMMs skip.
+    from torchao.prototype.mx_formats.mx_tensor import MXTensor
+
+    valid_R = torch.tensor([1, 1, 0, 0, 1, 1, 1, 0, 0, 0], dtype=torch.bool)
+    payload_RD = torch.full((10, 32), 0x7F, dtype=torch.uint8)  # E4M3 NaN
+    payload_RD[valid_R] = 0x38  # E4M3 1.0
+    rows_RD = MXTensor.from_qdata_and_scales(
+        payload_RD.view(torch.float8_e4m3fn),
+        torch.zeros(10, 1, dtype=torch.uint8).view(torch.float8_e8m0fnu),
+        torch.bfloat16,
+    )
+    counts_e = torch.tensor([4, 4], dtype=torch.int32)
+    monkeypatch.setattr(
+        nccl_ep._Dispatch,
+        "apply",
+        lambda *args: (rows_RD, torch.ones(10), counts_e, object(), None),
+    )
+    monkeypatch.setattr(
+        nccl_ep, "canonical_expert_order", lambda *args, **kwargs: (None, None, valid_R)
+    )
+    received_RD, _, _ = nccl_ep.dispatch(
+        torch.zeros(3, 32, dtype=torch.bfloat16),
+        torch.ones(3, 1),
+        torch.zeros(3, 1, dtype=torch.int64),
+        None,
+        10,
+        0,
+        3,
+        1,
+        2,
+        alignment=4,
+    )
+    expected_RD = torch.where(valid_R[:8, None], 0x38, 0).to(torch.uint8)
+    assert torch.equal(
+        received_RD.qdata.view(torch.uint8)[:8], expected_RD.expand(8, 32)
+    )
+
+
+@pytest.mark.parametrize(
+    "dispatcher_type,hidden_dim,quantized",
+    [(NCCLEPTokenDispatcher, 256, False), (MXFP8NCCLEPTokenDispatcher, 512, True)],
+)
+def test_native_dispatcher_config_builds_transport_owner(
+    dispatcher_type, hidden_dim, quantized
+):
+    config = dispatcher_type.Config(
+        num_experts=4, top_k=2, hidden_dim=hidden_dim, num_max_tokens_per_rank=16
+    )
+    dispatcher = config.build()
+    assert type(dispatcher) is dispatcher_type
+    assert dispatcher._mxfp8_transport is quantized
 
 
 @pytest.mark.parametrize("hidden_dim", [0, 7, 257])
@@ -181,6 +302,12 @@ def test_bf16_dispatch_preserves_values_and_forwards_identity(monkeypatch):
     native = object()
     monkeypatch.setattr(nccl_ep, "_prepare_routing", lambda *args: native)
     monkeypatch.setattr(nccl_ep, "wait_tensor", lambda value: value)
+
+    def forbid_quantization(*args):
+        raise AssertionError("BF16 transport must preserve the original values")
+
+    monkeypatch.setattr(nccl_ep, "quantize_mxfp8", forbid_quantization)
+    monkeypatch.setattr(nccl_ep, "dequantize_mxfp8", forbid_quantization)
 
     def forward_payload(
         handle, payload, scales, weights, capacity, layout, num_local_experts
@@ -222,8 +349,10 @@ def test_bf16_dispatch_preserves_values_and_forwards_identity(monkeypatch):
         1,
         2,
         1,
+        False,
     )
     assert torch.equal(output[0].view(torch.int16), tokens.view(torch.int16))
+    assert ctx.transport_mxfp8 is False
 
 
 @pytest.mark.parametrize("permuted", [False, True])
@@ -255,6 +384,7 @@ def test_bf16_combine_derivative_zeroes_group_padding(monkeypatch, permuted):
         valid_R=valid_R,
         counts_e=torch.tensor([4, 4], dtype=torch.int32),
         alignment=4,
+        transport_mxfp8=False,
     )
     x_RD = torch.zeros(10, 8, requires_grad=True)
     nccl_ep.combine(x_RD, metadata, 3).sum().backward()
@@ -271,6 +401,17 @@ def test_invalid_native_padding(pad_multiple):
             hidden_dim=512,
             num_max_tokens_per_rank=16,
             pad_multiple=pad_multiple,
+        )
+
+
+def test_mxfp8_transport_retains_native_alignment():
+    with pytest.raises(ValueError, match="requires pad_multiple=32"):
+        MXFP8NCCLEPTokenDispatcher.Config(
+            num_experts=4,
+            top_k=2,
+            hidden_dim=512,
+            num_max_tokens_per_rank=16,
+            pad_multiple=1,
         )
 
 
@@ -295,6 +436,17 @@ def test_bf16_dispatcher_rejects_unqualified_flow(ht_flow):
             hidden_dim=512,
             num_max_tokens_per_rank=16,
             ht_flow=ht_flow,
+        )
+
+
+def test_mxfp8_dispatcher_rejects_unsupported_pull_push():
+    with pytest.raises(ValueError, match="MXFP8 transport requires push_pull"):
+        MXFP8NCCLEPTokenDispatcher.Config(
+            num_experts=4,
+            top_k=2,
+            hidden_dim=512,
+            num_max_tokens_per_rank=16,
+            ht_flow="pull_push",
         )
 
 
@@ -403,22 +555,40 @@ def test_native_buffer_uses_configured_top_k(monkeypatch):
     assert dispatcher._ep_group is None
 
 
+def test_nvfp4_experts_report_unqualified_nccl_alignment():
+    from torchtitan.quantization.utils import swap_token_dispatcher
+
+    routed = SimpleNamespace(
+        token_dispatcher=NCCLEPTokenDispatcher.Config(
+            num_experts=4, top_k=2, hidden_dim=512, num_max_tokens_per_rank=16
+        )
+    )
+    original = routed.token_dispatcher
+    with pytest.raises(ValueError, match="NVFP4 expert GEMMs require pad_multiple=128"):
+        swap_token_dispatcher(routed, pad_multiple=128)
+    assert routed.token_dispatcher is original
+
+
 @pytest.mark.parametrize(
-    "scan_mode,ht_flow,bypass",
+    "scan_mode,receive_order,bypass",
     [
-        (None, "pull_push", False),
-        ("0", "pull_push", False),
-        ("1", "push_pull", False),
-        ("1", "pull_push", True),
+        (None, None, False),
+        ("0", "expert-ascend", False),
+        ("1", None, False),
+        ("1", "expert-ascend", True),
     ],
 )
-def test_bypass_requires_scan_mode_and_pull_push(
-    monkeypatch, scan_mode, ht_flow, bypass
+def test_mxfp8_bypass_requires_qualified_scan_and_receive_order(
+    monkeypatch, scan_mode, receive_order, bypass
 ):
-    if scan_mode is None:
-        monkeypatch.delenv("NCCL_EP_HT_AG_SCAN_MODE", raising=False)
-    else:
-        monkeypatch.setenv("NCCL_EP_HT_AG_SCAN_MODE", scan_mode)
+    for name, value in (
+        ("NCCL_EP_HT_AG_SCAN_MODE", scan_mode),
+        ("NCCL_EP_HT_RECV_TOPK_ORDER", receive_order),
+    ):
+        if value is None:
+            monkeypatch.delenv(name, raising=False)
+        else:
+            monkeypatch.setenv(name, value)
     tokens = torch.ones(2, 8, dtype=torch.bfloat16)
     scores = torch.ones(2)
     counts = torch.tensor([2], dtype=torch.int32)
@@ -435,6 +605,7 @@ def test_bypass_requires_scan_mode_and_pull_push(
         return order, order, torch.ones(2, dtype=torch.bool)
 
     monkeypatch.setattr(nccl_ep, "canonical_expert_order", canonical)
+    monkeypatch.setattr(nccl_ep, "_zero_bucket_padding_", lambda *args: None)
     nccl_ep.dispatch(
         tokens,
         scores[:, None],
@@ -445,8 +616,8 @@ def test_bypass_requires_scan_mode_and_pull_push(
         2,
         1,
         1,
-        alignment=1,
-        ht_flow=ht_flow,
+        alignment=32,
+        transport_mxfp8=True,
     )
     assert observed == [bypass]
 
